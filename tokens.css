@@ -5,6 +5,8 @@
   --bbs-red: var(--destructive, #f85149);
   --bbs-purple: #a371f7;
   --bbs-pink: #e5577f;
+  --bbs-orange: #db6d28;
+  --bbs-grey: #8b949e;
   --bbs-muted: var(--muted-foreground);
   --bbs-line: color-mix(in srgb, var(--border) 80%, transparent);
   --bbs-pill-height: 28px;

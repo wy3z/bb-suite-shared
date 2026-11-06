@@ -29,3 +29,27 @@ export function elapsed(from: number | string, now: number = Date.now()): string
   const at = typeof from === "number" ? from : Date.parse(from);
   return duration(Number.isFinite(at) ? (now - at) / 1000 : 0);
 }
+
+export function longAge(from: number | string, now: number = Date.now()): string {
+  const at = typeof from === "number" ? from : Date.parse(from);
+  const seconds = Math.max(0, Math.floor((now - (Number.isFinite(at) ? at : now)) / 1000));
+  if (seconds < 60) return "just now";
+  const [amount, unit] =
+    seconds < 3_600
+      ? [Math.floor(seconds / 60), "minute"]
+      : seconds < 86_400
+        ? [Math.floor(seconds / 3_600), "hour"]
+        : seconds < 604_800
+          ? [Math.floor(seconds / 86_400), "day"]
+          : seconds < 2_592_000
+            ? [Math.floor(seconds / 604_800), "week"]
+            : seconds < 31_536_000
+              ? [Math.floor(seconds / 2_592_000), "month"]
+              : [Math.floor(seconds / 31_536_000), "year"];
+  return `${amount} ${unit}${amount === 1 ? "" : "s"} ago`;
+}
+
+export function shortAgo(from: number | string, now: number = Date.now()): string {
+  const age = shortAge(from, now);
+  return age === "now" ? "just now" : `${age} ago`;
+}
