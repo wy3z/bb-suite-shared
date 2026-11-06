@@ -16,3 +16,14 @@
   --bbs-tray-radius: 10px;
   --bbs-dot: 6px;
 }
+
+:root {
+  --bbs-glass-surface: color-mix(in oklab, var(--background) 60%, transparent);
+  --bbs-glass-surface-hover: var(--surface-selected, var(--state-hover));
+  --bbs-glass-outline: var(--border);
+  --bbs-glass-blur: blur(28px) saturate(160%);
+}
+.dark {
+  --bbs-glass-surface: color-mix(in oklab, var(--popover) 45%, transparent);
+  --bbs-glass-outline: color-mix(in oklab, var(--foreground) 12%, transparent);
+}
