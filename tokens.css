@@ -1,0 +1,16 @@
+:root {
+  --bbs-accent: var(--timeline-accent, #3b82f6);
+  --bbs-green: var(--success, #3fb950);
+  --bbs-amber: var(--attention, #d29922);
+  --bbs-red: var(--destructive, #f85149);
+  --bbs-purple: #a371f7;
+  --bbs-pink: #e5577f;
+  --bbs-muted: var(--muted-foreground);
+  --bbs-line: color-mix(in srgb, var(--border) 80%, transparent);
+  --bbs-pill-height: 28px;
+  --bbs-pill-gap: 8px;
+  --bbs-pill-radius: 9999px;
+  --bbs-pill-font: 12.5px;
+  --bbs-tray-radius: 10px;
+  --bbs-dot: 6px;
+}

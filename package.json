@@ -1,0 +1,20 @@
+{
+  "name": "@wy3z/bb-suite",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared contracts, time formatting and design tokens for the wy3z BB plugin suite.",
+  "exports": {
+    "./time": "./src/time.ts",
+    "./contracts": "./src/contracts.ts",
+    "./tokens.css": "./tokens.css"
+  },
+  "peerDependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@get-bb/plugin-sdk": "^0.6.104",
+    "typescript": "^5.9.3",
+    "zod": "^4.6.7"
+  }
+}
