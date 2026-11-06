@@ -2,11 +2,11 @@
   --bbs-accent: var(--timeline-accent, #3b82f6);
   --bbs-green: var(--success, #3fb950);
   --bbs-amber: var(--attention, #d29922);
-  --bbs-red: var(--destructive, #f85149);
-  --bbs-purple: #a371f7;
-  --bbs-pink: #e5577f;
-  --bbs-orange: #db6d28;
-  --bbs-grey: #8b949e;
+  --bbs-red: var(--destructive-text, var(--destructive, #f85149));
+  --bbs-purple: var(--color-purple-400, #a371f7);
+  --bbs-pink: var(--color-pink-400, #e5577f);
+  --bbs-orange: var(--warning, #db6d28);
+  --bbs-grey: var(--muted-foreground);
   --bbs-muted: var(--muted-foreground);
   --bbs-line: color-mix(in srgb, var(--border) 80%, transparent);
   --bbs-pill-height: 28px;
