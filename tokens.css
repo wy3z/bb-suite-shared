@@ -58,6 +58,7 @@
   --bbs-live-orb-color: var(--color-timeline-accent, var(--timeline-accent, var(--primary)));
   --bbs-live-orb-size: 8px;
   --bbs-live-orb-halo: 0 0 0 3px color-mix(in oklch, var(--bbs-live-orb-color) 22%, transparent);
+  --bbs-done-color: var(--success, #3fb950);
 }
 
 @keyframes bbs-live-orb-pulse {
