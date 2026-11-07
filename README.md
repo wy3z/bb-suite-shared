@@ -8,6 +8,10 @@ and `bb plugin build` bundles it.
 - `@wy3z/bb-suite/contracts`: the Tasks plugin subset the suite reads, BB's git
   status read, the git actions served by pull-requests (commit, push, create
   PR, apply locally) and the Projects plugin's meta and leads.
+- `@wy3z/bb-suite/change-requests`: the provider-neutral change request read
+  served by pull-requests (`changeRequests`, keyed by environment id) for GitHub
+  pull requests and GitLab merge requests, its labels (`#12`, `!12`) and the
+  `bb-pull-requests:open` event detail. Frontend-safe: zod only, no SDK import.
 - `@wy3z/bb-suite/time`: `shortAge` ("now", "5m", "3d", "2w", "1mo"),
   `duration` ("2h 5m") and `elapsed`.
 - `@wy3z/bb-suite/tokens.css`: the suite palette (`--bbs-*`) and pill metrics.

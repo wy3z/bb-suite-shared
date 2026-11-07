@@ -7,6 +7,7 @@
   "exports": {
     "./time": "./src/time.ts",
     "./contracts": "./src/contracts.ts",
+    "./change-requests": "./src/change-requests.ts",
     "./tokens.css": "./tokens.css"
   },
   "peerDependencies": {
