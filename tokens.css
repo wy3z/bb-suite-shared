@@ -79,9 +79,7 @@
 
 .bbs-live-orb--ring {
   background: transparent;
-  box-shadow:
-    inset 0 0 0 1.5px color-mix(in oklch, var(--bbs-live-orb-color) 85%, transparent),
-    var(--bbs-live-orb-halo);
+  box-shadow: var(--bbs-live-orb-halo);
 }
 
 @media (prefers-reduced-motion: reduce) {
