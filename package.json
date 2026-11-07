@@ -13,7 +13,13 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "^0.6.104",
+    "@get-bb/plugin-sdk": "^0.6.132",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/react": "^19.0.0",
+    "better-sqlite3": "^12.0.0",
+    "cron-parser": "^5.5.0",
+    "hono": "^4.11.9",
+    "react": "^19.0.0",
     "typescript": "^5.9.3",
     "zod": "^4.6.7"
   }
