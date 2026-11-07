@@ -8,13 +8,39 @@
   --bbs-orange: var(--warning, #db6d28);
   --bbs-grey: var(--muted-foreground);
   --bbs-muted: var(--muted-foreground);
+  --bbs-text-primary: var(--foreground);
+  --bbs-text-secondary: color-mix(in srgb, var(--bbs-text-primary) 74%, transparent);
+  --bbs-text-tertiary: color-mix(in srgb, var(--bbs-text-primary) 60%, transparent);
   --bbs-line: color-mix(in srgb, var(--border) 80%, transparent);
-  --bbs-pill-height: 28px;
+  --bbs-pill-height: var(--bbs-height);
   --bbs-pill-gap: 8px;
   --bbs-pill-radius: 9999px;
   --bbs-pill-font: 12.5px;
   --bbs-tray-radius: 10px;
   --bbs-dot: 6px;
+
+  --bbs-text-meta: 11px;
+  --bbs-text-body: 12px;
+  --bbs-text-row: 13px;
+  --bbs-text-heading: 15px;
+  --bbs-text-display: 17px;
+
+  --bbs-icon-inline: 12px;
+  --bbs-icon: 14px;
+  --bbs-icon-toolbar: 16px;
+  --bbs-icon-stroke: 1.5;
+
+  --bbs-height: 28px;
+  --bbs-height-compact: 20px;
+
+  --bbs-radius-xs: 4px;
+  --bbs-radius-sm: 6px;
+  --bbs-radius-md: 8px;
+
+  --bbs-gap-tight: 2px;
+  --bbs-gap-xs: 4px;
+  --bbs-gap-icon: 6px;
+  --bbs-gap: 8px;
 }
 
 :root {
