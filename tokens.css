@@ -78,7 +78,7 @@
 }
 
 .bbs-live-orb--ring {
-  background: transparent;
+  background: var(--bbs-live-orb-color);
   box-shadow: var(--bbs-live-orb-halo);
 }
 
