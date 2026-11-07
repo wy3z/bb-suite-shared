@@ -32,6 +32,8 @@ export const CHANGE_REQUEST_UNAVAILABLE_REASONS = [
   "rateLimited",
   "unsupportedHost",
   "ambiguous",
+  "unverified",
+  "incomplete",
   "providerUnavailable",
   "unknown",
 ] as const;
