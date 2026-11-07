@@ -237,8 +237,27 @@ const metaSchema = z.object({
   focus: z.string().nullable(),
   focusUpdatedAt: z.string().nullable(),
   leadThreadId: z.string().nullable(),
+  sweepMinutes: z.number().int().nullable(),
+  sweepWorkingHours: z.boolean(),
+  sweepLastAt: z.string().nullable(),
+  followPrs: z.boolean(),
 });
 export type ProjectMeta = z.infer<typeof metaSchema>;
+
+export const SWEEP_CHOICES = [null, 60, 120, 240, 480] as const;
+export const NOTES_MAX = 20_000;
+
+const notesSchema = z.object({ text: z.string(), updatedAt: z.string().nullable() });
+export type ProjectNotes = z.infer<typeof notesSchema>;
+
+const inboxItemSchema = z.object({
+  at: z.string(),
+  source: z.string(),
+  text: z.string(),
+  ref: z.string().nullable(),
+  delivery: z.enum(["sent", "queued", "failed"]),
+});
+export type InboxItem = z.infer<typeof inboxItemSchema>;
 
 const projectIdSchema = z.string().trim().min(1).max(100);
 
@@ -260,5 +279,28 @@ export const projectsContract = defineRpcContract({
   setLead: {
     input: z.object({ projectId: projectIdSchema, threadId: z.string().startsWith("thr_").nullable() }),
     output: metaSchema,
+  },
+  setLoop: {
+    input: z.object({
+      projectId: projectIdSchema,
+      sweepMinutes: z.number().int().min(30).max(1440).nullable().optional(),
+      sweepWorkingHours: z.boolean().optional(),
+      followPrs: z.boolean().optional(),
+    }),
+    output: metaSchema,
+  },
+  getNotes: {
+    tags: (input: { projectId: string }) => [`notes:${input.projectId}`],
+    input: z.object({ projectId: projectIdSchema }),
+    output: notesSchema,
+  },
+  setNotes: {
+    input: z.object({ projectId: projectIdSchema, text: z.string().max(NOTES_MAX) }),
+    output: notesSchema,
+  },
+  listInbox: {
+    tags: (input: { projectId: string }) => [`inbox:${input.projectId}`],
+    input: z.object({ projectId: projectIdSchema }),
+    output: z.object({ items: z.array(inboxItemSchema) }),
   },
 });
