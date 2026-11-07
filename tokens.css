@@ -53,3 +53,32 @@
   --bbs-glass-surface: color-mix(in oklab, var(--popover) 45%, transparent);
   --bbs-glass-outline: color-mix(in oklab, var(--foreground) 12%, transparent);
 }
+
+:root {
+  --bbs-live-orb-color: var(--color-timeline-accent, var(--timeline-accent, var(--primary)));
+  --bbs-live-orb-size: 8px;
+  --bbs-live-orb-halo: 0 0 0 3px color-mix(in oklch, var(--bbs-live-orb-color) 22%, transparent);
+}
+
+@keyframes bbs-live-orb-pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.bbs-live-orb {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: var(--bbs-live-orb-size);
+  height: var(--bbs-live-orb-size);
+  border-radius: 9999px;
+  background: var(--bbs-live-orb-color);
+  box-shadow: var(--bbs-live-orb-halo);
+  animation: bbs-live-orb-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bbs-live-orb {
+    animation: none;
+  }
+}
