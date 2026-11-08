@@ -27,8 +27,8 @@ export class Clock {
 export function fakeBackend(clock: Clock, init = "none") {
   const sandboxes = new Map<string, FakeSandbox>();
   const snapshots = new Set<string>();
-  const calls = { create: 0, suspend: 0, resume: 0, remove: [] as Array<{ sandboxIds: string[]; snapshotIds: string[] }>, extend: 0, exec: [] as string[][] };
-  const faults: { create?: Error; exec?: Error; meta?: Record<string, string>; keepAfterRemove?: boolean } = {};
+  const calls = { create: 0, snapshot: 0, stop: 0, resume: 0, remove: [] as Array<{ sandboxIds: string[]; snapshotIds: string[] }>, extend: 0, exec: [] as string[][] };
+  const faults: { create?: Error; exec?: Error; meta?: Record<string, string>; keepAfterRemove?: boolean; progress?: string; createDelay?: number } = {};
   let seq = 0;
   const handle = (sandbox: FakeSandbox): SandboxHandle => ({
     id: sandbox.id,
@@ -41,8 +41,10 @@ export function fakeBackend(clock: Clock, init = "none") {
     displayName: "Fake Sandbox",
     description: "A sandbox that lives in memory.",
     icon: "cloud",
-    async create({ name, ttlMs }) {
+    async create({ name, ttlMs, report }) {
       calls.create += 1;
+      if (faults.progress) report.log(faults.progress);
+      if (faults.createDelay) await new Promise((resolve) => setTimeout(resolve, faults.createDelay));
       if (faults.create) throw faults.create;
       seq += 1;
       const sandbox = { id: `sb-${seq}`, name, running: true, expiresAt: clock.now() + ttlMs, snapshotId: null };
@@ -55,18 +57,24 @@ export function fakeBackend(clock: Clock, init = "none") {
       if (request.command.join(" ").includes("systemd")) request.onOutput(`${init}\n`);
       return { exitCode: 0 };
     },
-    async suspend({ sandboxId }) {
-      calls.suspend += 1;
-      const sandbox = sandboxes.get(sandboxId);
-      if (!sandbox) throw new Error("missing");
+    async snapshot({ sandboxId, report }) {
+      calls.snapshot += 1;
+      if (faults.progress) report.log(faults.progress);
+      if (!sandboxes.get(sandboxId)?.running) throw new Error("not running");
       seq += 1;
       const snapshotId = `snap-${seq}`;
       snapshots.add(snapshotId);
+      return { snapshotId };
+    },
+    async stop({ sandboxId }) {
+      calls.stop += 1;
+      if (!sandboxes.has(sandboxId)) throw new Error("missing");
       sandboxes.delete(sandboxId);
-      return { sandboxId: null, snapshotId };
+      return { sandboxId: null };
     },
     async resume({ name, snapshotId, ttlMs }) {
       calls.resume += 1;
+      if (faults.createDelay) await new Promise((resolve) => setTimeout(resolve, faults.createDelay));
       if (snapshotId === null || !snapshots.has(snapshotId)) throw new Error("no snapshot");
       seq += 1;
       const sandbox = { id: `sb-${seq}`, name, running: true, expiresAt: clock.now() + ttlMs, snapshotId };
@@ -121,6 +129,7 @@ export function fakeBb(clock: Clock) {
     projectEnv: [] as string[],
     builtInGit: "logged in" as string,
     pool: null as unknown,
+    resourceFault: null as ((hostId: string) => boolean) | null,
   };
   const api = {
     log: {
@@ -175,6 +184,7 @@ export function fakeBb(clock: Clock) {
         return { hostId: `host_${state.nextHost}abcdef` };
       },
       async getResource(hostId: string) {
+        if (state.resourceFault?.(hostId)) throw new Error("database is locked");
         return (resources.get(hostId) ?? null) as never;
       },
     },

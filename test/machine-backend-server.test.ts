@@ -1,99 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import {
-  readSandboxResource,
-  registerSandboxBackend,
-  type SandboxPolicyInput,
-  type SandboxResource,
-} from "../src/machine-backend-server.ts";
+import { registerSandboxBackend } from "../src/machine-backend-server.ts";
 import { Clock, fakeBackend, fakeBb, report } from "./sandbox-fakes.ts";
-
-const signal = () => new AbortController().signal;
-
-function setup(policy: SandboxPolicyInput = { hourlyRateUsd: 0.5 }, init = "none") {
-  const clock = new Clock();
-  const sdk = fakeBb(clock);
-  const fake = fakeBackend(clock, init);
-  const registration = registerSandboxBackend(sdk.bb, fake.backend, policy, { now: clock.now });
-
-  async function create(key: string, attempt = 1, inputs: unknown = null) {
-    const checkpoints: SandboxResource[] = [];
-    const progress = report();
-    const before = sdk.state.nextHost;
-    const result = await sdk.machine.create({
-      key,
-      attempt,
-      inputs: inputs as never,
-      checkpoint: async (resource) => {
-        checkpoints.push(readSandboxResource(resource));
-      },
-      report: progress.progress,
-      signal: signal(),
-    });
-    let hostId: string | null = null;
-    if (result.status === "created") {
-      hostId = sdk.state.nextHost > before ? `host_${sdk.state.nextHost}abcdef` : sdk.hosts.find((h) => readSandboxResource(sdk.resources.get(h.id)).key === key)!.id;
-      if (!sdk.hosts.some((host) => host.id === hostId)) {
-        sdk.hosts.push({ id: hostId, machineProviderId: "fake-sandbox", lifecycle: { phase: "active" } });
-      }
-      sdk.resources.set(hostId, result.resource);
-    }
-    return { result, checkpoints, lines: progress.lines, hostId };
-  }
-
-  function host(hostId: string) {
-    return sdk.hosts.find((candidate) => candidate.id === hostId)!;
-  }
-
-  async function suspend(hostId: string) {
-    const progress = report();
-    const out = await sdk.machine.suspend!({
-      hostId,
-      resource: sdk.resources.get(hostId) as never,
-      checkpoint: async (resource) => {
-        sdk.resources.set(hostId, resource);
-      },
-      report: progress.progress,
-      signal: signal(),
-    });
-    sdk.resources.set(hostId, out.resource);
-    host(hostId).lifecycle.phase = "suspended";
-    return readSandboxResource(out.resource);
-  }
-
-  async function resume(hostId: string) {
-    const progress = report();
-    const out = await sdk.machine.resume!({
-      hostId,
-      resource: sdk.resources.get(hostId) as never,
-      checkpoint: async (resource) => {
-        sdk.resources.set(hostId, resource);
-      },
-      report: progress.progress,
-      signal: signal(),
-    });
-    sdk.resources.set(hostId, out.resource);
-    host(hostId).lifecycle.phase = "active";
-    return readSandboxResource(out.resource);
-  }
-
-  async function remove(hostId: string) {
-    const progress = report();
-    const out = await sdk.machine.remove({
-      hostId,
-      resource: sdk.resources.get(hostId) as never,
-      report: progress.progress,
-      signal: signal(),
-    });
-    if (out.status === "removed") host(hostId).lifecycle.phase = "destroyed";
-    return out;
-  }
-
-  async function allocation(name: string) {
-    return sdk.kv.get(`sandbox/alloc/${name}`) as Record<string, unknown> | undefined;
-  }
-
-  return { clock, sdk, fake, registration, create, suspend, resume, remove, host, allocation };
-}
+import { setup, signal } from "./sandbox-harness.ts";
 
 describe("registration", () => {
   it("registers the machine provider, the composed project-checkout environment and a minute sweep", () => {
@@ -265,7 +173,8 @@ describe("suspend and resume", () => {
     expect(t.fake.sandboxes.size).toBe(0);
     expect(t.sdk.kv.has(`sandbox/idle/${hostId}`)).toBe(false);
     await t.suspend(hostId!);
-    expect(t.fake.calls.suspend).toBe(1);
+    expect(t.fake.calls.snapshot).toBe(1);
+    expect(t.fake.calls.stop).toBe(1);
     const resumed = await t.resume(hostId!);
     expect(resumed).toMatchObject({ state: "running", sandboxId: "sb-3", snapshotId: "snap-2" });
     expect(t.sdk.state.bootstraps.map((b) => b.key)).toEqual(["thr_sr", "thr_sr"]);
@@ -389,6 +298,7 @@ describe("allocation sweep", () => {
     t.sdk.state.bootstrapFault = new Error("lost");
     const { checkpoints } = await t.create("thr_orphan");
     const name = checkpoints[0]!.name;
+    await t.registration.sweep();
     t.clock.advance(5);
     await t.registration.sweep();
     expect(t.fake.sandboxes.size).toBe(1);
@@ -404,6 +314,7 @@ describe("allocation sweep", () => {
     const t = setup({ hourlyRateUsd: 0.5, orphans: "retain" });
     t.sdk.state.bootstrapFault = new Error("lost");
     await t.create("thr_keep");
+    await t.registration.sweep();
     t.clock.advance(30);
     await t.registration.sweep();
     expect(t.fake.sandboxes.size).toBe(1);

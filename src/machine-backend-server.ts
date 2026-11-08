@@ -67,13 +67,18 @@ export interface SandboxBackend<S extends SandboxInputsSchema = undefined> {
     report: SandboxProgress;
   }): Promise<SandboxHandle>;
   exec(sandboxId: string, request: MachineExecutorRequest): Promise<{ exitCode: number }>;
-  suspend(request: {
+  snapshot(request: {
     sandboxId: string;
     name: string;
-    snapshotId: string | null;
     signal: AbortSignal;
     report: SandboxProgress;
-  }): Promise<{ sandboxId: string | null; snapshotId: string | null }>;
+  }): Promise<{ snapshotId: string | null }>;
+  stop(request: {
+    sandboxId: string;
+    name: string;
+    signal: AbortSignal;
+    report: SandboxProgress;
+  }): Promise<{ sandboxId: string | null }>;
   resume(request: {
     name: string;
     sandboxId: string | null;
@@ -132,7 +137,7 @@ export interface SandboxBackendRegistration {
   refusal(): Promise<string | null>;
 }
 
-const ALLOCATION_STATES = ["allocating", "running", "suspended", "stopped"] as const;
+const ALLOCATION_STATES = ["allocating", "resuming", "running", "suspended", "stopped"] as const;
 const allocationSchema = z.object({
   key: z.string().min(1),
   name: z.string().min(1),
@@ -145,6 +150,7 @@ const allocationSchema = z.object({
   expiresAt: z.number().nullable(),
   failures: z.number().int().nonnegative(),
   nextAttemptAt: z.number(),
+  unownedSince: z.number().nullable().default(null),
 });
 type Allocation = z.output<typeof allocationSchema>;
 
@@ -188,6 +194,19 @@ function asResource(resource: SandboxResource): ProviderResource {
   return resource as unknown as ProviderResource;
 }
 
+function redactingReport(report: SandboxProgress): SandboxProgress {
+  return {
+    step: (text) => report.step(redactSecrets(text)),
+    log: (text) => report.log(redactSecrets(text)),
+  };
+}
+
+function redactDecision<T extends { message: string } | { status: "available" } | { action: "accept" }>(value: T): T {
+  return "message" in value ? { ...value, message: redactSecrets(value.message) } : value;
+}
+
+type Owned = Map<string, { host: Host; resource: SandboxResource }>;
+
 export function registerSandboxBackend<S extends SandboxInputsSchema = undefined>(
   bb: SandboxPluginApi,
   backend: SandboxBackend<S>,
@@ -199,6 +218,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
   const kv = bb.storage.kv;
   const label = backend.displayName;
   const inFlight = new Set<string>();
+  let admissionChain: Promise<unknown> = Promise.resolve();
   const nameFor = (key: string) => backend.nameFor?.(key) ?? sandboxNameForKey(key);
   const logReport: SandboxProgress = {
     step: (text) => bb.log.info(redactSecrets(text)),
@@ -222,6 +242,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
       expiresAt: null,
       failures: 0,
       nextAttemptAt: 0,
+      unownedSince: null,
     };
   }
 
@@ -293,18 +314,48 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     };
   }
 
-  async function refusalFor(excludeName: string | null): Promise<string | null> {
-    const current = await readPolicy();
+  async function spendRefusal(current: SandboxPolicy): Promise<string | null> {
     if (current.monthlyCapUsd !== null && current.hourlyRateUsd === null) {
       return missingRateMessage(label, current.monthlyCapUsd);
     }
-    const capped = monthlyCapRefusal(label, await usage());
-    if (capped !== null) return capped;
+    return monthlyCapRefusal(label, await usage());
+  }
+
+  function holdsSlot(allocation: Allocation): boolean {
+    if (allocation.state === "running") return true;
+    if (allocation.state !== "allocating" && allocation.state !== "resuming") return false;
+    return inFlight.has(allocation.name) || allocation.sandboxId !== null;
+  }
+
+  async function refusalFor(excludeName: string | null): Promise<string | null> {
+    const current = await readPolicy();
+    const spend = await spendRefusal(current);
+    if (spend !== null) return spend;
     const running = (await listAllocations()).filter(
-      (allocation) =>
-        allocation.name !== excludeName && (allocation.state === "allocating" || allocation.state === "running"),
+      (allocation) => allocation.name !== excludeName && holdsSlot(allocation),
     ).length;
     return concurrencyRefusal(label, running, current.maxConcurrent);
+  }
+
+  function admit<T>(run: () => Promise<T>): Promise<T> {
+    const next = admissionChain.then(run, run);
+    admissionChain = next.catch(() => undefined);
+    return next;
+  }
+
+  async function reserve(
+    key: string,
+    name: string,
+    state: "allocating" | "resuming",
+  ): Promise<string | null> {
+    return admit(async () => {
+      const refusal = await refusalFor(name);
+      if (refusal !== null) return refusal;
+      await patchAllocation(key, name, (allocation) => ({
+        state: allocation.state === "running" ? "running" : state,
+      }));
+      return null;
+    });
   }
 
   async function bumpIdle(hostId: string): Promise<void> {
@@ -321,20 +372,22 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     if (host.machineProviderId === backend.id && host.lifecycle.phase === "active") await bumpIdle(hostId);
   }
 
-  async function owners(): Promise<Map<string, { host: Host; resource: SandboxResource }>> {
-    const out = new Map<string, { host: Host; resource: SandboxResource }>();
+  async function owners(): Promise<{ owned: Owned; complete: boolean }> {
+    const owned: Owned = new Map();
+    let complete = true;
     for (const host of await bb.sdk.hosts.list()) {
       if (host.machineProviderId !== backend.id || host.lifecycle.phase === "destroyed") continue;
       try {
         const value = await bb.experimental_machines.getResource(host.id);
         if (value === null) continue;
         const resource = readSandboxResource(value);
-        out.set(resource.key, { host, resource });
+        owned.set(resource.key, { host, resource });
       } catch (error) {
+        complete = false;
         bb.log.warn(`${label}: resource lookup failed for ${host.id}: ${errorText(error)}`);
       }
     }
-    return out;
+    return { owned, complete };
   }
 
   function executorFor(sandboxId: string): MachineExecutor {
@@ -385,6 +438,8 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
 
   async function extendAllocation(allocation: Allocation, current: SandboxPolicy): Promise<number | null> {
     if (!backend.extendTtl || allocation.sandboxId === null || allocation.state !== "running") return null;
+    const spend = await spendRefusal(current);
+    if (spend !== null) throw new Error(spend);
     const { expiresAt } = await backend.extendTtl({
       sandboxId: allocation.sandboxId,
       name: allocation.name,
@@ -396,7 +451,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     return expiresAt;
   }
 
-  async function suspendIdleHost(host: Host): Promise<void> {
+  async function requestSuspend(host: Host, why: string): Promise<void> {
     try {
       await bb.sdk.hosts.experimental_suspend({ hostId: host.id });
     } catch (error) {
@@ -404,11 +459,11 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
       const fresh = await bb.sdk.hosts.get({ hostId: host.id }).catch(() => null);
       const phase = fresh?.lifecycle.phase;
       if (phase === "suspending" || phase === "suspended" || phase === "resuming") return;
-      bb.log.warn(`${label}: idle suspend failed for ${host.id}: ${errorText(error)}`);
+      bb.log.warn(`${label}: ${why} suspend failed for ${host.id}: ${errorText(error)}`);
     }
   }
 
-  async function importAllocations(owned: Map<string, { host: Host; resource: SandboxResource }>, at: number) {
+  async function importAllocations(owned: Owned, at: number) {
     for (const { host, resource } of owned.values()) {
       if (inFlight.has(resource.name) || (await readAllocation(resource.name)) !== null) continue;
       const running = host.lifecycle.phase === "active" && resource.state === "running";
@@ -423,11 +478,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     }
   }
 
-  async function sweepAllocations(
-    owned: Map<string, { host: Host; resource: SandboxResource }>,
-    current: SandboxPolicy,
-    at: number,
-  ) {
+  async function sweepAllocations(owned: Owned, complete: boolean, current: SandboxPolicy, at: number) {
     const graceMs = current.orphanGraceMinutes * MINUTE;
     for (const stored of await listAllocations()) {
       if (inFlight.has(stored.name) || stored.nextAttemptAt > at) continue;
@@ -438,8 +489,18 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
         const running = live.filter((handle) => handle.running);
         const owner = owned.get(allocation.key) ?? null;
         if (owner === null) {
-          if (at - allocation.createdAt < graceMs) {
+          if (!complete) {
             await writeAllocation(allocation);
+            continue;
+          }
+          allocation = { ...allocation, unownedSince: allocation.unownedSince ?? at };
+          if (at - allocation.unownedSince! < graceMs) {
+            await writeAllocation(allocation);
+            continue;
+          }
+          const fresh = await owners();
+          if (!fresh.complete || fresh.owned.has(allocation.key) || inFlight.has(allocation.name)) {
+            await writeAllocation({ ...allocation, unownedSince: fresh.owned.has(allocation.key) ? null : allocation.unownedSince });
             continue;
           }
           if (live.length === 0 && allocation.snapshotIds.length === 0) {
@@ -468,11 +529,12 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
         if (owner.host.lifecycle.phase === "suspended" && running.length > 0) {
           await bb.sdk.hosts.experimental_reconcile({ hostId: owner.host.id });
         }
-        const head = running[0] ?? null;
+        const head = running.find((handle) => handle.id === owner.resource.sandboxId) ?? running[0] ?? null;
         const suspended = owner.host.lifecycle.phase === "suspended" || allocation.state === "suspended";
         allocation = {
           ...allocation,
           hostId: owner.host.id,
+          unownedSince: null,
           state: head !== null ? "running" : suspended ? "suspended" : "stopped",
           sandboxId: head?.id ?? allocation.sandboxId,
           snapshotIds: unique([owner.resource.snapshotId, ...owner.resource.staleSnapshotIds]),
@@ -503,24 +565,31 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
       return;
     }
     const at = now();
-    const owned = await owners();
+    const { owned, complete } = await owners();
     await importAllocations(owned, at);
-    await sweepAllocations(owned, current, at);
+    await sweepAllocations(owned, complete, current, at);
+    const capped = monthlyCapRefusal(label, await usage());
+    const unbudgeted = current.monthlyCapUsd !== null && current.hourlyRateUsd === null;
+    if (capped !== null) bb.log.warn(`${capped} Suspending running sandboxes.`);
     const idleMs = current.idleMinutes === null ? null : current.idleMinutes * MINUTE;
     const renewMs = current.ttlRenewMinutes * MINUTE;
     for (const { host, resource } of owned.values()) {
       if (host.lifecycle.phase !== "active" || inFlight.has(resource.name)) continue;
       try {
+        if (capped !== null) {
+          await requestSuspend(host, "monthly cap");
+          continue;
+        }
         const lastActive = await readIdle(host.id);
         if (lastActive === null) {
           await bumpIdle(host.id);
           continue;
         }
         if (idleMs !== null && at >= lastActive + idleMs) {
-          await suspendIdleHost(host);
+          await requestSuspend(host, "idle");
           continue;
         }
-        if (at - lastActive >= Math.min(renewMs, idleMs ?? renewMs)) continue;
+        if (unbudgeted || at - lastActive >= Math.min(renewMs, idleMs ?? renewMs)) continue;
         const allocation = await readAllocation(resource.name);
         if (allocation === null || allocation.expiresAt === null || allocation.expiresAt - at > renewMs) continue;
         await extendAllocation(allocation, current);
@@ -547,6 +616,14 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     }
   }
 
+  async function releaseIfIdle(resource: Pick<SandboxResource, "key" | "name">, fallback: "suspended" | "stopped") {
+    const live = await backend.listByName(resource.name, AbortSignal.timeout(vendorTimeoutMs)).catch(() => null);
+    if (live === null || live.some((handle) => handle.running)) return;
+    const stored = await readAllocation(resource.name);
+    if (stored === null || stored.state === "running" || stored.state === "suspended") return;
+    await patchAllocation(resource.key, resource.name, () => ({ state: fallback, accruedAt: null }));
+  }
+
   bb.experimental_environments.register({
     id: backend.id,
     displayName: backend.displayName,
@@ -564,7 +641,9 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     ephemeral: backend.ephemeral ?? true,
     inputs: backend.inputs,
     async availability() {
-      const base: SandboxAvailability = backend.availability ? await backend.availability() : { status: "available" };
+      const base: SandboxAvailability = backend.availability
+        ? redactDecision(await backend.availability())
+        : { status: "available" };
       if (base.status !== "available") return base;
       let current: SandboxPolicy;
       try {
@@ -588,15 +667,16 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
       }
       const refusal = await refusalFor(null);
       if (refusal !== null) return { action: "refuse", message: refusal };
-      return backend.validate ? backend.validate(inputs) : { action: "accept" };
+      return backend.validate ? redactDecision(await backend.validate(inputs)) : { action: "accept" };
     },
     async create(context) {
       const name = nameFor(context.key);
+      const report = redactingReport(context.report);
       return guarded(name, async () => {
         try {
-          const refusal = await refusalFor(name);
-          if (refusal !== null) return { status: "failed", message: refusal };
           assertSecretFree(context.inputs, "machine inputs");
+          const refusal = await reserve(context.key, name, "allocating");
+          if (refusal !== null) return { status: "failed", message: refusal };
           const current = await readPolicy();
           let resource: SandboxResource = {
             v: SANDBOX_RESOURCE_VERSION,
@@ -610,54 +690,53 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
             init: "unknown",
             meta: {},
           };
-          await patchAllocation(context.key, name, (allocation) => ({
-            state: allocation.state === "running" ? "running" : "allocating",
-          }));
           await context.checkpoint(asResource(resource));
           const live = await backend.listByName(name, context.signal);
           let handle = live.find((candidate) => candidate.running) ?? null;
           if (handle !== null) {
-            context.report.log(`Reusing ${label} sandbox ${handle.id} from an earlier attempt`);
+            report.log(`Reusing ${label} sandbox ${handle.id} from an earlier attempt`);
           } else {
-            context.report.step(`Creating the ${label} sandbox…`);
+            report.step(`Creating the ${label} sandbox…`);
             handle = await backend.create({
               key: context.key,
               name,
               inputs: context.inputs,
               ttlMs: current.ttlMinutes * MINUTE,
               signal: context.signal,
-              report: context.report,
+              report,
             });
           }
           context.signal.throwIfAborted();
           const created = handle;
-          assertSecretFree(created.meta ?? {}, "sandbox metadata");
-          resource = { ...resource, state: "running", sandboxId: created.id, meta: created.meta ?? {} };
-          await context.checkpoint(asResource(resource));
           await patchAllocation(context.key, name, (allocation, at) => ({
             state: "running",
             sandboxId: created.id,
             accruedAt: allocation.accruedAt ?? at,
             expiresAt: created.expiresAt,
           }));
-          const init = await probeInit(created.id, context.report, context.signal);
+          assertSecretFree(created.meta ?? {}, "sandbox metadata");
+          resource = { ...resource, state: "running", sandboxId: created.id, meta: created.meta ?? {} };
+          await context.checkpoint(asResource(resource));
+          const init = await probeInit(created.id, report, context.signal);
           if (init !== resource.init) {
             resource = { ...resource, init };
             await context.checkpoint(asResource(resource));
           }
-          const { hostId } = await bootstrap(context.key, created.id, context.report, context.signal);
+          const { hostId } = await bootstrap(context.key, created.id, report, context.signal);
           context.signal.throwIfAborted();
           await patchAllocation(context.key, name, () => ({ hostId }));
           await bumpIdle(hostId);
           return { status: "created", name: machineName(hostId), resource: asResource(resource) };
         } catch (error) {
+          await releaseIfIdle({ key: context.key, name }, "stopped");
           context.signal.throwIfAborted();
           return { status: "failed", message: errorText(error) };
         }
       });
     },
-    async reconcileCleanup({ key, report, signal }) {
+    async reconcileCleanup({ key, report: rawReport, signal }) {
       const name = nameFor(key);
+      const report = redactingReport(rawReport);
       return guarded(name, async () => {
         try {
           const live = await backend.listByName(name, signal);
@@ -678,33 +757,75 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     },
     async suspend(context) {
       const resource = readSandboxResource(context.resource);
+      const report = redactingReport(context.report);
       return guarded(resource.name, async () => {
         try {
           const live = await backend.listByName(resource.name, context.signal);
-          const running = live.find((handle) => handle.running) ?? null;
-          let next: SandboxResource;
-          if (running === null) {
+          const running = live.filter((handle) => handle.running);
+          let next: SandboxResource = resource;
+          if (running.length === 0) {
+            const stoppedInPlace = resource.sandboxId !== null && live.some((handle) => handle.id === resource.sandboxId);
+            if (resource.snapshotId === null && !stoppedInPlace) {
+              throw new Error(
+                `${label}: compute for ${resource.name} is gone and there is no saved snapshot or stopped sandbox to restore; refusing to report it suspended. Remove the machine to clean up.`,
+              );
+            }
             next = { ...resource, state: "suspended" };
             if (resource.state !== "suspended") await context.checkpoint(asResource(next));
           } else {
-            context.report.step(`Suspending the ${label} sandbox…`);
-            const saved = await backend.suspend({
-              sandboxId: running.id,
+            const primary = running.find((handle) => handle.id === resource.sandboxId) ?? running[0]!;
+            const duplicates = running.filter((handle) => handle.id !== primary.id);
+            if (duplicates.length > 0) {
+              report.log(`Removing ${duplicates.length} duplicate ${label} allocation(s) for ${resource.name}`);
+              await backend.remove({
+                name: resource.name,
+                sandboxIds: duplicates.map((handle) => handle.id),
+                snapshotIds: [],
+                signal: context.signal,
+                report,
+              });
+            }
+            report.step(`Saving the ${label} sandbox…`);
+            const saved = await backend.snapshot({
+              sandboxId: primary.id,
               name: resource.name,
-              snapshotId: resource.snapshotId,
               signal: context.signal,
-              report: context.report,
+              report,
             });
-            const replaced =
-              resource.snapshotId !== null && saved.snapshotId !== null && saved.snapshotId !== resource.snapshotId;
+            const tracked = await patchAllocation(resource.key, resource.name, (allocation) => ({
+              snapshotIds: unique([...allocation.snapshotIds, saved.snapshotId]),
+            }));
+            const snapshotId = saved.snapshotId ?? resource.snapshotId;
             next = {
               ...resource,
-              state: "suspended",
-              sandboxId: saved.sandboxId,
-              snapshotId: saved.snapshotId ?? resource.snapshotId,
-              staleSnapshotIds: unique([...resource.staleSnapshotIds, replaced ? resource.snapshotId : null]),
+              sandboxId: primary.id,
+              snapshotId,
+              staleSnapshotIds: unique(
+                [...resource.staleSnapshotIds, resource.snapshotId, ...tracked.snapshotIds].filter((id) => id !== snapshotId),
+              ),
             };
             await context.checkpoint(asResource(next));
+            report.step(`Stopping the ${label} sandbox…`);
+            const stopped = await backend.stop({
+              sandboxId: primary.id,
+              name: resource.name,
+              signal: context.signal,
+              report,
+            });
+            next = { ...next, state: "suspended", sandboxId: stopped.sandboxId };
+            await context.checkpoint(asResource(next));
+            if (next.snapshotId === null && next.sandboxId === null) {
+              throw new Error(
+                `${label}: ${resource.name} stopped without a snapshot or a stopped sandbox to restore; its state is lost.`,
+              );
+            }
+          }
+          const after = await backend.listByName(resource.name, context.signal);
+          const still = after.filter((handle) => handle.running);
+          if (still.length > 0) {
+            throw new Error(
+              `${label}: ${still.length} ${resource.name} allocation(s) are still running after suspend; retry.`,
+            );
           }
           await patchAllocation(resource.key, resource.name, () => ({
             state: "suspended",
@@ -723,17 +844,18 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     },
     async resume(context) {
       const resource = readSandboxResource(context.resource);
+      const report = redactingReport(context.report);
       return guarded(resource.name, async () => {
         try {
-          const refusal = await refusalFor(resource.name);
+          const refusal = await reserve(resource.key, resource.name, "resuming");
           if (refusal !== null) throw new Error(refusal);
           const current = await readPolicy();
           const live = await backend.listByName(resource.name, context.signal);
           let handle = live.find((candidate) => candidate.running) ?? null;
           if (handle !== null) {
-            context.report.log(`Reusing running ${label} sandbox ${handle.id}`);
+            report.log(`Reusing running ${label} sandbox ${handle.id}`);
           } else {
-            context.report.step(`Resuming the ${label} sandbox…`);
+            report.step(`Resuming the ${label} sandbox…`);
             handle = await backend.resume({
               name: resource.name,
               sandboxId: resource.sandboxId,
@@ -741,11 +863,18 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
               meta: resource.meta,
               ttlMs: current.ttlMinutes * MINUTE,
               signal: context.signal,
-              report: context.report,
+              report,
             });
           }
           context.signal.throwIfAborted();
           const resumed = handle;
+          await patchAllocation(resource.key, resource.name, (allocation, at) => ({
+            state: "running",
+            hostId: context.hostId,
+            sandboxId: resumed.id,
+            accruedAt: allocation.accruedAt ?? at,
+            expiresAt: resumed.expiresAt,
+          }));
           assertSecretFree(resumed.meta ?? {}, "sandbox metadata");
           let next: SandboxResource = {
             ...resource,
@@ -754,14 +883,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
             meta: { ...resource.meta, ...resumed.meta },
           };
           await context.checkpoint(asResource(next));
-          await patchAllocation(resource.key, resource.name, (allocation, at) => ({
-            state: "running",
-            hostId: context.hostId,
-            sandboxId: resumed.id,
-            accruedAt: allocation.accruedAt ?? at,
-            expiresAt: resumed.expiresAt,
-          }));
-          await bootstrap(resource.key, resumed.id, context.report, context.signal);
+          await bootstrap(resource.key, resumed.id, report, context.signal);
           await bumpIdle(context.hostId);
           if (next.staleSnapshotIds.length > 0) {
             try {
@@ -770,17 +892,18 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
                 sandboxIds: [],
                 snapshotIds: next.staleSnapshotIds,
                 signal: context.signal,
-                report: context.report,
+                report,
               });
               next = { ...next, staleSnapshotIds: [] };
               await context.checkpoint(asResource(next));
               await patchAllocation(resource.key, resource.name, () => ({ snapshotIds: unique([next.snapshotId]) }));
             } catch (error) {
-              context.report.log(`Stale snapshot cleanup will retry later: ${errorText(error)}`);
+              report.log(`Stale snapshot cleanup will retry later: ${errorText(error)}`);
             }
           }
           return { resource: asResource(next) };
         } catch (error) {
+          await releaseIfIdle(resource, "suspended");
           context.signal.throwIfAborted();
           throw new Error(errorText(error));
         }
@@ -793,20 +916,16 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
       } catch (error) {
         return { status: "failed", message: `${label}: unreadable machine resource: ${errorText(error)}` };
       }
+      const report = redactingReport(context.report);
       return guarded(resource.name, async () => {
         try {
           const live = await backend.listByName(resource.name, context.signal);
           const sandboxIds = unique([resource.sandboxId, ...live.map((handle) => handle.id)]);
-          const snapshotIds = unique([resource.snapshotId, ...resource.staleSnapshotIds]);
+          const stored = await readAllocation(resource.name);
+          const snapshotIds = unique([resource.snapshotId, ...resource.staleSnapshotIds, ...(stored?.snapshotIds ?? [])]);
           if (sandboxIds.length > 0 || snapshotIds.length > 0) {
-            context.report.step(`Removing the ${label} sandbox…`);
-            await backend.remove({
-              name: resource.name,
-              sandboxIds,
-              snapshotIds,
-              signal: context.signal,
-              report: context.report,
-            });
+            report.step(`Removing the ${label} sandbox…`);
+            await backend.remove({ name: resource.name, sandboxIds, snapshotIds, signal: context.signal, report });
           }
           if ((await backend.listByName(resource.name, context.signal)).length > 0) {
             return { status: "failed", message: `${label}: ${resource.name} is still present; retry removal.` };
@@ -827,7 +946,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     if (thread.status !== "starting" && thread.status !== "active") return;
     try {
       if (thread.environmentId === null) {
-        const match = (await owners()).get(thread.id);
+        const match = (await owners()).owned.get(thread.id);
         if (match !== undefined && match.host.lifecycle.phase === "active") await bumpIdle(match.host.id);
         return;
       }
