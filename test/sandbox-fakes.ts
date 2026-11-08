@@ -113,6 +113,14 @@ export function fakeBb(clock: Clock) {
     bootstrapFault: null as Error | null,
     suspendFault: null as Error | null,
     nextHost: 0,
+    dispatch: null as ((context: never) => Promise<unknown>) | null,
+    envReads: [] as string[],
+    poolReads: 0,
+    envFault: null as Error | null,
+    globalEnv: [] as string[],
+    projectEnv: [] as string[],
+    builtInGit: "logged in" as string,
+    pool: null as unknown,
   };
   const api = {
     log: {
@@ -140,6 +148,12 @@ export function fakeBb(clock: Clock) {
     background: {
       schedule(name: string, cron: string, fn: () => unknown) {
         schedules.push({ name, cron, fn });
+      },
+    },
+    experimental_hooks: {
+      on(hook: string, handler: (context: never) => Promise<unknown>) {
+        if (hook !== "message.dispatch" || state.dispatch) throw new Error("unexpected hook");
+        state.dispatch = handler;
       },
     },
     events: {
@@ -187,6 +201,25 @@ export function fakeBb(clock: Clock) {
         async experimental_reconcile({ hostId }: { hostId: string }) {
           state.reconciles.push(hostId);
           return hosts.find((host) => host.id === hostId);
+        },
+      },
+      projects: {
+        async machineEnvironment({ projectId }: { projectId: string }) {
+          state.envReads.push(projectId);
+          if (state.envFault) throw state.envFault;
+          const row = (name: string) => ({ name, note: null, secret: true, value: null });
+          return {
+            builtInGit: { status: state.builtInGit, statusMessage: "" },
+            inheritedVariables: state.globalEnv.map(row),
+            variables: state.projectEnv.map(row),
+          };
+        },
+      },
+      plugins: {
+        async callRpc({ pluginId, method }: { pluginId: string; method: string }) {
+          state.poolReads += 1;
+          if (pluginId !== "account-pool" || method !== "status.get" || state.pool === null) throw new Error("plugin not enabled");
+          return state.pool;
         },
       },
       environments: {

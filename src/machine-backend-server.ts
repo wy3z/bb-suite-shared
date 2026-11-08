@@ -26,8 +26,10 @@ import {
   type SandboxResource,
   type SandboxUsage,
 } from "./machine-backend";
+import { createCloudLaunchCheck, type CloudLaunchCheckOptions } from "./cloud-launch-server";
 
 export * from "./machine-backend";
+export * from "./cloud-launch-server";
 
 export type SandboxInputsSchema = PluginMachineProviderDeclaration["inputs"];
 type Declaration<S extends SandboxInputsSchema> = PluginMachineProviderDeclaration<S>;
@@ -102,11 +104,14 @@ export interface SandboxPluginApi {
   readonly storage: { readonly kv: PluginKvStorage };
   readonly background: Pick<BbPluginApi["background"], "schedule">;
   readonly events: BbPluginApi["events"];
+  readonly experimental_hooks: Pick<BbPluginApi["experimental_hooks"], "on">;
   readonly experimental_machines: Pick<BbPluginApi["experimental_machines"], "register" | "bootstrap" | "getResource">;
   readonly experimental_environments: Pick<BbPluginApi["experimental_environments"], "register">;
   readonly sdk: {
     readonly hosts: Pick<PluginBbSdk["hosts"], "list" | "get" | "experimental_suspend" | "experimental_reconcile">;
     readonly environments: Pick<PluginBbSdk["environments"], "get">;
+    readonly projects: Pick<PluginBbSdk["projects"], "machineEnvironment">;
+    readonly plugins: Pick<PluginBbSdk["plugins"], "callRpc">;
   };
 }
 
@@ -116,6 +121,7 @@ export interface SandboxRegistrationOptions {
   now?: () => number;
   scheduleName?: string;
   vendorTimeoutMs?: number;
+  launchCheck?: CloudLaunchCheckOptions | false;
 }
 
 export interface SandboxBackendRegistration {
@@ -841,6 +847,10 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
   });
 
   bb.background.schedule(options.scheduleName ?? "sandbox-sweep", "* * * * *", sweep);
+
+  if (options.launchCheck !== false) {
+    bb.experimental_hooks.on("message.dispatch", createCloudLaunchCheck(bb, backend.id, options.launchCheck ?? {}));
+  }
 
   return { sweep, bumpIdle, extendTtl, usage, refusal: () => refusalFor(null) };
 }
