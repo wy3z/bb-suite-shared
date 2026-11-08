@@ -12,6 +12,20 @@ and `bb plugin build` bundles it.
   served by pull-requests (`changeRequests`, keyed by environment id) for GitHub
   pull requests and GitLab merge requests, its labels (`#12`, `!12`) and the
   `bb-pull-requests:open` event detail. Frontend-safe: zod only, no SDK import.
+- `@wy3z/bb-suite/machine-backend`: the sandbox policy (`idleMinutes` 15,
+  `ttlMinutes` 120, `maxConcurrent` 2, `monthlyCapUsd` 30, `hourlyRateUsd`,
+  orphan handling), the machine resource schema, cap and concurrency refusal
+  messages, `findSecretLike` and `redactSecrets`. Frontend-safe: zod only.
+- `@wy3z/bb-suite/machine-backend/server`: `registerSandboxBackend(bb, backend,
+  policy)` for vendor machine plugins. The vendor supplies only `create`,
+  `exec`, `suspend`, `resume`, `remove`, `listByName` and optional `extendTtl`;
+  the helper registers the machine provider (idempotent create keyed by name,
+  checkpoints before allocating, core bootstrap over the vendor exec, systemd
+  probe, suspend/resume with re-bootstrap, remove, `reconcileCleanup`), the
+  composed `project-checkout` environment, and a minute sweep that suspends
+  idle machines, extends the vendor TTL while a machine is active, meters
+  running time against the monthly cap and removes orphaned allocations.
+  Server-only.
 - `@wy3z/bb-suite/time`: `shortAge` ("now", "5m", "3d", "2w", "1mo"),
   `duration` ("2h 5m") and `elapsed`.
 - `@wy3z/bb-suite/tokens.css`: the suite palette (`--bbs-*`) and pill metrics.
