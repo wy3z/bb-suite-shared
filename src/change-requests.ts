@@ -86,16 +86,19 @@ const unrecognisedRow = {
   message: "This change request row isn't in a format this plugin understands.",
 };
 
+const environmentBranchSchema = z.string().nullable().optional();
+
 export const changeRequestRowSchema = z
   .discriminatedUnion("outcome", [
-    z.object({ outcome: z.literal("available"), changeRequest: changeRequestSchema }),
-    z.object({ outcome: z.literal("absent"), provider: providerSchema.nullable().catch(null) }),
+    z.object({ outcome: z.literal("available"), changeRequest: changeRequestSchema, environmentBranch: environmentBranchSchema }),
+    z.object({ outcome: z.literal("absent"), provider: providerSchema.nullable().catch(null), environmentBranch: environmentBranchSchema }),
     z.object({
       outcome: z.literal("unavailable"),
       provider: providerSchema.nullable().catch(null),
       reason: z.enum(CHANGE_REQUEST_UNAVAILABLE_REASONS).catch("unknown"),
       message: z.string(),
       candidates: z.number().int().nonnegative().optional(),
+      environmentBranch: environmentBranchSchema,
     }),
   ])
   .catch(unrecognisedRow);
