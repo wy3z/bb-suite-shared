@@ -74,7 +74,7 @@ export interface SandboxBackend<S extends SandboxInputsSchema = undefined> {
     signal: AbortSignal;
     report: SandboxProgress;
   }): Promise<{ snapshotId: string | null }>;
-  findSnapshot(request: { name: string; operationKey: string; signal: AbortSignal }): Promise<string | null>;
+  findSnapshot?(request: { name: string; operationKey: string; signal: AbortSignal }): Promise<string | null>;
   stop(request: {
     sandboxId: string;
     name: string;
@@ -137,6 +137,8 @@ export interface SandboxBackendRegistration {
   extendTtl(hostId: string): Promise<number | null>;
   usage(): Promise<SandboxUsage>;
   refusal(): Promise<string | null>;
+  unverifiedSnapshots(): Promise<Array<{ name: string; key: string; operationKey: string; recordedAt: number }>>;
+  forgetUnverifiedSnapshot(operationKey: string): Promise<void>;
 }
 
 const ALLOCATION_STATES = ["allocating", "resuming", "running", "suspended", "stopped"] as const;
@@ -154,12 +156,21 @@ const allocationSchema = z.object({
   nextAttemptAt: z.number(),
   unownedSince: z.number().nullable().default(null),
   pendingSnapshotOps: z.array(z.string()).default([]),
+  unverifiedSnapshotOps: z.array(z.string()).default([]),
+  rev: z.number().int().nonnegative().default(0),
 });
 type Allocation = z.output<typeof allocationSchema>;
 
 const ALLOCATION_PREFIX = "sandbox/alloc/";
 const IDLE_PREFIX = "sandbox/idle/";
 const USAGE_PREFIX = "sandbox/usage/";
+const UNVERIFIED_PREFIX = "sandbox/unverified/";
+const unverifiedSchema = z.object({
+  name: z.string(),
+  key: z.string(),
+  operationKey: z.string(),
+  recordedAt: z.number(),
+});
 const MINUTE = 60_000;
 const INIT_PROBE = ["sh", "-c", "if [ -d /run/systemd/system ]; then echo systemd; else echo none; fi"];
 const NO_SYSTEMD_NOTE =
@@ -222,6 +233,8 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
   const label = backend.displayName;
   const inFlight = new Set<string>();
   let admissionChain: Promise<unknown> = Promise.resolve();
+  let storeChain: Promise<unknown> = Promise.resolve();
+  let sweepRun: Promise<void> | null = null;
   const nameFor = (key: string) => backend.nameFor?.(key) ?? sandboxNameForKey(key);
   const logReport: SandboxProgress = {
     step: (text) => bb.log.info(redactSecrets(text)),
@@ -247,6 +260,8 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
       nextAttemptAt: 0,
       unownedSince: null,
       pendingSnapshotOps: [],
+      unverifiedSnapshotOps: [],
+      rev: 0,
     };
   }
 
@@ -257,6 +272,52 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
 
   async function writeAllocation(allocation: Allocation): Promise<void> {
     await kv.set(`${ALLOCATION_PREFIX}${allocation.name}`, allocation);
+  }
+
+  function exclusive<T>(run: () => Promise<T>): Promise<T> {
+    const next = storeChain.then(run, run);
+    storeChain = next.catch(() => undefined);
+    return next;
+  }
+
+  async function addUsage(base: Allocation, at: number): Promise<void> {
+    if (base.accruedAt === null) return;
+    const delta = Math.max(0, at - base.accruedAt);
+    if (delta === 0) return;
+    const month = usageMonth(at);
+    await kv.set(`${USAGE_PREFIX}${month}`, (await readUsageMs(month)) + delta);
+  }
+
+  async function commitAllocation(
+    key: string,
+    name: string,
+    build: (current: Allocation, at: number) => Partial<Allocation> | null,
+    expectedRev?: number | null,
+  ): Promise<Allocation | null> {
+    return exclusive(async () => {
+      const at = now();
+      const stored = await readAllocation(name);
+      if (expectedRev !== undefined && (stored === null ? null : stored.rev) !== expectedRev) return null;
+      const base = stored ?? freshAllocation(key, name, at);
+      const current = base.accruedAt === null ? base : { ...base, accruedAt: at };
+      const patch = build(current, at);
+      if (patch === null) return null;
+      const next: Allocation = { ...current, ...patch, rev: stored === null ? 0 : stored.rev + 1 };
+      await writeAllocation(next);
+      await addUsage(base, at);
+      return next;
+    });
+  }
+
+  async function deleteAllocation(name: string, expectedRev?: number): Promise<boolean> {
+    return exclusive(async () => {
+      const stored = await readAllocation(name);
+      if (stored === null) return true;
+      if (expectedRev !== undefined && stored.rev !== expectedRev) return false;
+      await kv.delete(`${ALLOCATION_PREFIX}${name}`);
+      await addUsage(stored, now());
+      return true;
+    });
   }
 
   async function listAllocations(): Promise<Allocation[]> {
@@ -274,32 +335,16 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     return typeof value === "number" && Number.isFinite(value) ? value : 0;
   }
 
-  async function accrue(allocation: Allocation, at: number): Promise<Allocation> {
-    if (allocation.accruedAt === null) return allocation;
-    const delta = Math.max(0, at - allocation.accruedAt);
-    if (delta > 0) {
-      const month = usageMonth(at);
-      await kv.set(`${USAGE_PREFIX}${month}`, (await readUsageMs(month)) + delta);
-    }
-    return { ...allocation, accruedAt: at };
-  }
-
   async function patchAllocation(
     key: string,
     name: string,
     patch: (current: Allocation, at: number) => Partial<Allocation>,
   ): Promise<Allocation> {
-    const at = now();
-    const current = await accrue((await readAllocation(name)) ?? freshAllocation(key, name, at), at);
-    const next = { ...current, ...patch(current, at) };
-    await writeAllocation(next);
-    return next;
+    return (await commitAllocation(key, name, patch))!;
   }
 
   async function dropAllocation(name: string): Promise<void> {
-    const current = await readAllocation(name);
-    if (current !== null) await accrue(current, now());
-    await kv.delete(`${ALLOCATION_PREFIX}${name}`);
+    await deleteAllocation(name);
   }
 
   async function usage(): Promise<SandboxUsage> {
@@ -465,115 +510,128 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     }
   }
 
-  async function importAllocations(owned: Owned, at: number) {
+  async function importAllocations(owned: Owned) {
     for (const { host, resource } of owned.values()) {
-      if (inFlight.has(resource.name) || (await readAllocation(resource.name)) !== null) continue;
+      if (inFlight.has(resource.name)) continue;
       const running = host.lifecycle.phase === "active" && resource.state === "running";
-      await writeAllocation({
-        ...freshAllocation(resource.key, resource.name, at),
-        state: running ? "running" : resource.state === "allocating" ? "allocating" : "suspended",
-        hostId: host.id,
-        sandboxId: resource.sandboxId,
-        snapshotIds: unique([resource.snapshotId, ...resource.staleSnapshotIds]),
-        accruedAt: running ? at : null,
-      });
+      await commitAllocation(
+        resource.key,
+        resource.name,
+        (_, at) => ({
+          state: running ? "running" : resource.state === "allocating" ? "allocating" : "suspended",
+          hostId: host.id,
+          sandboxId: resource.sandboxId,
+          snapshotIds: unique([resource.snapshotId, ...resource.staleSnapshotIds]),
+          unverifiedSnapshotOps: unique(resource.unverifiedSnapshotOps),
+          accruedAt: running ? at : null,
+        }),
+        null,
+      );
+    }
+  }
+
+  async function sweepAllocation(stored: Allocation, owned: Owned, complete: boolean, current: SandboxPolicy, at: number) {
+    const { key, name } = stored;
+    let rev = stored.rev;
+    const commit = async (fields: (cur: Allocation, at: number) => Partial<Allocation>) => {
+      const out = await commitAllocation(key, name, fields, rev);
+      if (out === null) bb.log.debug(`${label}: ${name} changed during the sweep; leaving it for the next one`);
+      else rev = out.rev;
+      return out;
+    };
+    try {
+      const signal = AbortSignal.timeout(vendorTimeoutMs);
+      const live = await backend.listByName(name, signal);
+      const running = live.filter((handle) => handle.running);
+      const observe = (cur: Allocation, now_: number): Partial<Allocation> => {
+        if (cur.state !== "allocating" && cur.state !== "resuming" && cur.state !== "running") return {};
+        const found = running.find((handle) => handle.id === cur.sandboxId) ?? running[0] ?? null;
+        return found !== null
+          ? { state: "running", sandboxId: found.id, accruedAt: cur.accruedAt ?? now_, expiresAt: found.expiresAt ?? cur.expiresAt }
+          : { state: cur.state === "resuming" ? "suspended" : "stopped", accruedAt: null };
+      };
+      const owner = owned.get(key) ?? null;
+      if (owner === null) {
+        if (!complete) {
+          await commit(observe);
+          return;
+        }
+        const unownedSince = stored.unownedSince ?? at;
+        if (at - unownedSince < current.orphanGraceMinutes * MINUTE) {
+          await commit((cur, t) => ({ ...observe(cur, t), unownedSince }));
+          return;
+        }
+        const fresh = await owners();
+        if (!fresh.complete || fresh.owned.has(key) || inFlight.has(name)) {
+          await commit((cur, t) => ({ ...observe(cur, t), unownedSince: fresh.owned.has(key) ? null : unownedSince }));
+          return;
+        }
+        if ((await commit((cur, t) => ({ ...observe(cur, t), unownedSince }))) === null) return;
+        const ledger = await resolvePendingSnapshots(key, name, signal, logReport);
+        if (ledger !== null) rev = ledger.rev;
+        const snapshotIds = ledger?.snapshotIds ?? [];
+        if (live.length === 0 && snapshotIds.length === 0) {
+          if ((ledger?.unverifiedSnapshotOps.length ?? 0) === 0) await deleteAllocation(name, rev);
+          return;
+        }
+        if (current.orphans === "retain") {
+          bb.log.warn(`${label}: ${name} has no machine; retaining it for inspection`);
+          await commit(() => ({ failures: 0, nextAttemptAt: 0 }));
+          return;
+        }
+        if (inFlight.has(name)) return;
+        await backend.remove({ name, sandboxIds: live.map((handle) => handle.id), snapshotIds, signal, report: logReport });
+        if ((await backend.listByName(name, signal)).length > 0) {
+          throw new Error(`${name} is still present after orphan cleanup`);
+        }
+        if (await deleteAllocation(name, rev)) bb.log.warn(`${label}: removed orphaned sandbox ${name} (no machine owns it)`);
+        return;
+      }
+      if (owner.host.lifecycle.phase === "suspended" && running.length > 0) {
+        await bb.sdk.hosts.experimental_reconcile({ hostId: owner.host.id });
+      }
+      const head = running.find((handle) => handle.id === owner.resource.sandboxId) ?? running[0] ?? null;
+      await commit((cur, t) => ({
+        hostId: owner.host.id,
+        unownedSince: null,
+        state:
+          head !== null
+            ? "running"
+            : owner.host.lifecycle.phase === "suspended" || cur.state === "suspended"
+              ? "suspended"
+              : "stopped",
+        sandboxId: head?.id ?? cur.sandboxId,
+        snapshotIds: unique([...cur.snapshotIds, owner.resource.snapshotId, ...owner.resource.staleSnapshotIds]),
+        unverifiedSnapshotOps: unique([...cur.unverifiedSnapshotOps, ...owner.resource.unverifiedSnapshotOps]),
+        accruedAt: head !== null ? (cur.accruedAt ?? t) : null,
+        expiresAt: head !== null ? (head.expiresAt ?? cur.expiresAt) : cur.expiresAt,
+        failures: 0,
+        nextAttemptAt: 0,
+      }));
+    } catch (error) {
+      await commit((cur) => ({
+        failures: Math.min(cur.failures + 1, 7),
+        nextAttemptAt: at + Math.min(60 * MINUTE, MINUTE * 2 ** Math.min(cur.failures, 6)),
+      }));
+      bb.log.warn(`${label}: allocation sweep failed for ${name}: ${errorText(error)}`);
     }
   }
 
   async function sweepAllocations(owned: Owned, complete: boolean, current: SandboxPolicy, at: number) {
-    const graceMs = current.orphanGraceMinutes * MINUTE;
     for (const stored of await listAllocations()) {
       if (inFlight.has(stored.name) || stored.nextAttemptAt > at) continue;
-      let allocation = await accrue(stored, at);
-      try {
-        const signal = AbortSignal.timeout(vendorTimeoutMs);
-        const live = await backend.listByName(allocation.name, signal);
-        const running = live.filter((handle) => handle.running);
-        if (allocation.state === "allocating" || allocation.state === "resuming" || allocation.state === "running") {
-          const found = running.find((handle) => handle.id === allocation.sandboxId) ?? running[0] ?? null;
-          allocation =
-            found !== null
-              ? {
-                  ...allocation,
-                  state: "running",
-                  sandboxId: found.id,
-                  accruedAt: allocation.accruedAt ?? at,
-                  expiresAt: found.expiresAt ?? allocation.expiresAt,
-                }
-              : { ...allocation, state: allocation.state === "resuming" ? "suspended" : "stopped", accruedAt: null };
-        }
-        const owner = owned.get(allocation.key) ?? null;
-        if (owner === null) {
-          if (!complete) {
-            await writeAllocation(allocation);
-            continue;
-          }
-          allocation = { ...allocation, unownedSince: allocation.unownedSince ?? at };
-          if (at - allocation.unownedSince! < graceMs) {
-            await writeAllocation(allocation);
-            continue;
-          }
-          const fresh = await owners();
-          if (!fresh.complete || fresh.owned.has(allocation.key) || inFlight.has(allocation.name)) {
-            await writeAllocation({ ...allocation, unownedSince: fresh.owned.has(allocation.key) ? null : allocation.unownedSince });
-            continue;
-          }
-          await writeAllocation(allocation);
-          allocation = (await resolvePendingSnapshots(allocation.key, allocation.name, signal)) ?? allocation;
-          if (live.length === 0 && allocation.snapshotIds.length === 0) {
-            await kv.delete(`${ALLOCATION_PREFIX}${allocation.name}`);
-            continue;
-          }
-          if (current.orphans === "retain") {
-            bb.log.warn(`${label}: ${allocation.name} has no machine; retaining it for inspection`);
-            await writeAllocation({ ...allocation, failures: 0, nextAttemptAt: 0 });
-            continue;
-          }
-          await backend.remove({
-            name: allocation.name,
-            sandboxIds: live.map((handle) => handle.id),
-            snapshotIds: allocation.snapshotIds,
-            signal,
-            report: logReport,
-          });
-          if ((await backend.listByName(allocation.name, signal)).length > 0) {
-            throw new Error(`${allocation.name} is still present after orphan cleanup`);
-          }
-          await kv.delete(`${ALLOCATION_PREFIX}${allocation.name}`);
-          bb.log.warn(`${label}: removed orphaned sandbox ${allocation.name} (no machine owns it)`);
-          continue;
-        }
-        if (owner.host.lifecycle.phase === "suspended" && running.length > 0) {
-          await bb.sdk.hosts.experimental_reconcile({ hostId: owner.host.id });
-        }
-        const head = running.find((handle) => handle.id === owner.resource.sandboxId) ?? running[0] ?? null;
-        const suspended = owner.host.lifecycle.phase === "suspended" || allocation.state === "suspended";
-        allocation = {
-          ...allocation,
-          hostId: owner.host.id,
-          unownedSince: null,
-          state: head !== null ? "running" : suspended ? "suspended" : "stopped",
-          sandboxId: head?.id ?? allocation.sandboxId,
-          snapshotIds: unique([...allocation.snapshotIds, owner.resource.snapshotId, ...owner.resource.staleSnapshotIds]),
-          accruedAt: head !== null ? (allocation.accruedAt ?? at) : null,
-          expiresAt: head !== null ? (head.expiresAt ?? allocation.expiresAt) : allocation.expiresAt,
-          failures: 0,
-          nextAttemptAt: 0,
-        };
-        await writeAllocation(allocation);
-      } catch (error) {
-        const failures = Math.min(allocation.failures + 1, 7);
-        await writeAllocation({
-          ...allocation,
-          failures,
-          nextAttemptAt: at + Math.min(60 * MINUTE, MINUTE * 2 ** Math.min(allocation.failures, 6)),
-        });
-        bb.log.warn(`${label}: allocation sweep failed for ${allocation.name}: ${errorText(error)}`);
-      }
+      await sweepAllocation(stored, owned, complete, current, at);
     }
   }
 
-  async function sweep(): Promise<void> {
+  function sweep(): Promise<void> {
+    sweepRun ??= runSweep().finally(() => {
+      sweepRun = null;
+    });
+    return sweepRun;
+  }
+
+  async function runSweep(): Promise<void> {
     let current: SandboxPolicy;
     try {
       current = await readPolicy();
@@ -583,7 +641,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     }
     const at = now();
     const { owned, complete } = await owners();
-    await importAllocations(owned, at);
+    await importAllocations(owned);
     await sweepAllocations(owned, complete, current, at);
     const capped = monthlyCapRefusal(label, await usage());
     const unbudgeted = current.monthlyCapUsd !== null && current.hourlyRateUsd === null;
@@ -636,33 +694,68 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
   async function settleAfterFailure(resource: Pick<SandboxResource, "key" | "name">, fallback: "suspended" | "stopped") {
     const live = await backend.listByName(resource.name, AbortSignal.timeout(vendorTimeoutMs)).catch(() => null);
     if (live === null) return;
-    const stored = await readAllocation(resource.name);
-    if (stored === null || stored.state === "suspended" || stored.state === "stopped") return;
-    const running = live.find((handle) => handle.running && handle.id === stored.sandboxId) ?? live.find((handle) => handle.running);
-    if (running !== undefined) {
-      await patchAllocation(resource.key, resource.name, (allocation, at) => ({
-        state: "running",
-        sandboxId: running.id,
-        accruedAt: allocation.accruedAt ?? at,
-        expiresAt: running.expiresAt ?? allocation.expiresAt,
-      }));
-      return;
-    }
-    await patchAllocation(resource.key, resource.name, () => ({ state: fallback, accruedAt: null }));
+    await commitAllocation(resource.key, resource.name, (cur, at) => {
+      if (cur.state === "suspended" || cur.state === "stopped") return null;
+      const running = live.find((handle) => handle.running && handle.id === cur.sandboxId) ?? live.find((handle) => handle.running);
+      return running !== undefined
+        ? { state: "running", sandboxId: running.id, accruedAt: cur.accruedAt ?? at, expiresAt: running.expiresAt ?? cur.expiresAt }
+        : { state: fallback, accruedAt: null };
+    });
   }
 
-  async function resolvePendingSnapshots(key: string, name: string, signal: AbortSignal): Promise<Allocation | null> {
+  function unverifiedNote(name: string, operationKeys: readonly string[]): string {
+    return `${label}: ${operationKeys.length} snapshot request(s) for ${name} lost their response and ${label} offers no way to look them up, so a snapshot may exist that BB is not tracking (operation ${operationKeys.join(", ")}). Check ${label} for orphaned snapshots of ${name} and delete them manually.`;
+  }
+
+  async function markUnverified(key: string, name: string, operationKeys: readonly string[], report: SandboxProgress) {
+    if (operationKeys.length === 0) return;
+    for (const operationKey of operationKeys) {
+      await kv.set(`${UNVERIFIED_PREFIX}${operationKey}`, { name, key, operationKey, recordedAt: now() });
+    }
+    await patchAllocation(key, name, (cur) => ({
+      pendingSnapshotOps: cur.pendingSnapshotOps.filter((op) => !operationKeys.includes(op)),
+      unverifiedSnapshotOps: unique([...cur.unverifiedSnapshotOps, ...operationKeys]),
+    }));
+    const note = unverifiedNote(name, operationKeys);
+    report.log(note);
+    bb.log.warn(note);
+  }
+
+  async function resolvePendingSnapshots(
+    key: string,
+    name: string,
+    signal: AbortSignal,
+    report: SandboxProgress,
+  ): Promise<Allocation | null> {
     const stored = await readAllocation(name);
     if (stored === null || stored.pendingSnapshotOps.length === 0) return stored;
+    const pending = stored.pendingSnapshotOps;
+    if (!backend.findSnapshot) {
+      await markUnverified(key, name, pending, report);
+      return readAllocation(name);
+    }
     const found: string[] = [];
-    for (const operationKey of stored.pendingSnapshotOps) {
+    for (const operationKey of pending) {
       const snapshotId = await backend.findSnapshot({ name, operationKey, signal });
       if (snapshotId !== null) found.push(snapshotId);
     }
     return patchAllocation(key, name, (allocation) => ({
       snapshotIds: unique([...allocation.snapshotIds, ...found]),
-      pendingSnapshotOps: allocation.pendingSnapshotOps.filter((op) => !stored.pendingSnapshotOps.includes(op)),
+      pendingSnapshotOps: allocation.pendingSnapshotOps.filter((op) => !pending.includes(op)),
     }));
+  }
+
+  async function unverifiedSnapshots(): Promise<Array<{ name: string; key: string; operationKey: string; recordedAt: number }>> {
+    const out: Array<{ name: string; key: string; operationKey: string; recordedAt: number }> = [];
+    for (const entry of await kv.list(UNVERIFIED_PREFIX)) {
+      const parsed = unverifiedSchema.safeParse(await kv.get(entry));
+      if (parsed.success) out.push(parsed.data);
+    }
+    return out;
+  }
+
+  async function forgetUnverifiedSnapshot(operationKey: string): Promise<void> {
+    await kv.delete(`${UNVERIFIED_PREFIX}${operationKey}`);
   }
 
   bb.experimental_environments.register({
@@ -729,6 +822,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
             snapshotId: null,
             snapshotSandboxId: null,
             staleSnapshotIds: [],
+            unverifiedSnapshotOps: [],
             init: "unknown",
             meta: {},
           };
@@ -832,26 +926,45 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
                 report,
               });
             }
-            await resolvePendingSnapshots(resource.key, resource.name, context.signal);
-            const operationKey = `${resource.name}-${globalThis.crypto.randomUUID().slice(0, 12)}`;
-            await patchAllocation(resource.key, resource.name, (allocation) => ({
-              pendingSnapshotOps: unique([...allocation.pendingSnapshotOps, operationKey]),
-            }));
-            report.step(`Saving the ${label} sandbox…`);
-            const saved = await backend.snapshot({
-              sandboxId: primary.id,
-              name: resource.name,
-              operationKey,
-              signal: context.signal,
-              report,
-            });
-            const tracked = await patchAllocation(resource.key, resource.name, (allocation) => ({
-              snapshotIds: unique([...allocation.snapshotIds, saved.snapshotId]),
-              pendingSnapshotOps: allocation.pendingSnapshotOps.filter((op) => op !== operationKey),
-            }));
+            const resolved = await resolvePendingSnapshots(resource.key, resource.name, context.signal, report);
+            let unverified = unique([...resource.unverifiedSnapshotOps, ...(resolved?.unverifiedSnapshotOps ?? [])]);
+            const attempts = backend.findSnapshot ? 1 : 2;
+            let saved: { snapshotId: string | null } | null = null;
+            for (let attempt = 1; saved === null; attempt += 1) {
+              const operationKey = `${resource.name}-${globalThis.crypto.randomUUID().slice(0, 12)}`;
+              await patchAllocation(resource.key, resource.name, (allocation) => ({
+                pendingSnapshotOps: unique([...allocation.pendingSnapshotOps, operationKey]),
+              }));
+              report.step(`Saving the ${label} sandbox…`);
+              try {
+                saved = await backend.snapshot({
+                  sandboxId: primary.id,
+                  name: resource.name,
+                  operationKey,
+                  signal: context.signal,
+                  report,
+                });
+              } catch (error) {
+                if (backend.findSnapshot) throw error;
+                await markUnverified(resource.key, resource.name, [operationKey], report);
+                unverified = unique([...unverified, operationKey]);
+                await context.checkpoint(asResource({ ...resource, unverifiedSnapshotOps: unverified }));
+                context.signal.throwIfAborted();
+                if (attempt >= attempts) throw error;
+                report.log(`Retrying the ${label} snapshot; the sandbox keeps running until a snapshot is recorded.`);
+                continue;
+              }
+              const done = saved;
+              await patchAllocation(resource.key, resource.name, (allocation) => ({
+                snapshotIds: unique([...allocation.snapshotIds, done.snapshotId]),
+                pendingSnapshotOps: allocation.pendingSnapshotOps.filter((op) => op !== operationKey),
+              }));
+            }
+            const tracked = (await readAllocation(resource.name))!;
             const snapshotId = saved.snapshotId ?? resource.snapshotId;
             next = {
               ...resource,
+              unverifiedSnapshotOps: unverified,
               sandboxId: primary.id,
               snapshotId,
               snapshotSandboxId: saved.snapshotId !== null ? primary.id : resource.snapshotSandboxId,
@@ -979,8 +1092,19 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
         try {
           const live = await backend.listByName(resource.name, context.signal);
           const sandboxIds = unique([resource.sandboxId, ...live.map((handle) => handle.id)]);
-          const stored = await resolvePendingSnapshots(resource.key, resource.name, context.signal);
+          const stored = await resolvePendingSnapshots(resource.key, resource.name, context.signal, report);
           const snapshotIds = unique([resource.snapshotId, ...resource.staleSnapshotIds, ...(stored?.snapshotIds ?? [])]);
+          const unverified = unique([...resource.unverifiedSnapshotOps, ...(stored?.unverifiedSnapshotOps ?? [])]);
+          for (const operationKey of unverified) {
+            if ((await kv.get(`${UNVERIFIED_PREFIX}${operationKey}`)) === undefined) {
+              await kv.set(`${UNVERIFIED_PREFIX}${operationKey}`, { name: resource.name, key: resource.key, operationKey, recordedAt: now() });
+            }
+          }
+          if (unverified.length > 0) {
+            const note = unverifiedNote(resource.name, unverified);
+            report.log(note);
+            bb.log.warn(note);
+          }
           if (sandboxIds.length > 0 || snapshotIds.length > 0) {
             report.step(`Removing the ${label} sandbox…`);
             await backend.remove({ name: resource.name, sandboxIds, snapshotIds, signal: context.signal, report });
@@ -1029,5 +1153,13 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     bb.experimental_hooks.on("message.dispatch", createCloudLaunchCheck(bb, backend.id, options.launchCheck ?? {}));
   }
 
-  return { sweep, bumpIdle, extendTtl, usage, refusal: () => refusalFor(null) };
+  return {
+    sweep,
+    bumpIdle,
+    extendTtl,
+    usage,
+    refusal: () => refusalFor(null),
+    unverifiedSnapshots,
+    forgetUnverifiedSnapshot,
+  };
 }

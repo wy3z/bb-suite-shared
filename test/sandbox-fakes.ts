@@ -28,7 +28,7 @@ export function fakeBackend(clock: Clock, init = "none") {
   const sandboxes = new Map<string, FakeSandbox>();
   const snapshots = new Set<string>();
   const calls = { create: 0, snapshot: 0, stop: 0, resume: 0, remove: [] as Array<{ sandboxIds: string[]; snapshotIds: string[] }>, extend: 0, exec: [] as string[][] };
-  const faults: { create?: Error; exec?: Error; meta?: Record<string, string>; keepAfterRemove?: boolean; progress?: string; createDelay?: number; createLoseResponse?: boolean; snapshotLoseResponse?: boolean } = {};
+  const faults: { create?: Error; exec?: Error; meta?: Record<string, string>; keepAfterRemove?: boolean; progress?: string; createDelay?: number; createLoseResponse?: boolean; snapshotLoseResponse?: boolean; snapshotLoseCount?: number; pauseList?: { reached: () => void; release: Promise<void> } } = {};
   const snapshotOps = new Map<string, string>();
   let seq = 0;
   const handle = (sandbox: FakeSandbox): SandboxHandle => ({
@@ -72,6 +72,10 @@ export function fakeBackend(clock: Clock, init = "none") {
       const snapshotId = `snap-${seq}`;
       snapshots.add(snapshotId);
       snapshotOps.set(operationKey, snapshotId);
+      if (faults.snapshotLoseCount) {
+        faults.snapshotLoseCount -= 1;
+        throw new Error("timeout waiting for snapshot response");
+      }
       if (faults.snapshotLoseResponse) {
         faults.snapshotLoseResponse = false;
         throw new Error("timeout waiting for snapshot response");
@@ -104,6 +108,12 @@ export function fakeBackend(clock: Clock, init = "none") {
       for (const id of snapshotIds) snapshots.delete(id);
     },
     async listByName(name) {
+      const pause = faults.pauseList;
+      if (pause) {
+        faults.pauseList = undefined;
+        pause.reached();
+        await pause.release;
+      }
       return [...sandboxes.values()].filter((sandbox) => sandbox.name === name).map(handle);
     },
     async extendTtl({ sandboxId, ttlMs }) {

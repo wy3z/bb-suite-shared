@@ -38,6 +38,7 @@ export const sandboxResourceSchema = z.object({
   snapshotId: z.string().min(1).nullable(),
   snapshotSandboxId: z.string().min(1).nullable().default(null),
   staleSnapshotIds: z.array(z.string().min(1)),
+  unverifiedSnapshotOps: z.array(z.string().min(1)).default([]),
   init: z.enum(SANDBOX_INIT_KINDS),
   meta: z.record(z.string(), z.json()),
 });

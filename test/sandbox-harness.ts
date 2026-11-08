@@ -47,18 +47,19 @@ export function setup(policy: SandboxPolicySource = { hourlyRateUsd: 0.5 }, init
   async function suspend(hostId: string, opts: { failCheckpoint?: number; lines?: string[] } = {}) {
     const progress = report();
     let checkpoints = 0;
-    const out = await sdk.machine.suspend!({
-      hostId,
-      resource: sdk.resources.get(hostId) as never,
-      checkpoint: async (resource) => {
-        checkpoints += 1;
-        if (checkpoints === opts.failCheckpoint) throw new Error("checkpoint write failed");
-        sdk.resources.set(hostId, resource);
-      },
-      report: progress.progress,
-      signal: signal(),
-    });
-    opts.lines?.push(...progress.lines);
+    const out = await sdk.machine
+      .suspend!({
+        hostId,
+        resource: sdk.resources.get(hostId) as never,
+        checkpoint: async (resource) => {
+          checkpoints += 1;
+          if (checkpoints === opts.failCheckpoint) throw new Error("checkpoint write failed");
+          sdk.resources.set(hostId, resource);
+        },
+        report: progress.progress,
+        signal: signal(),
+      })
+      .finally(() => opts.lines?.push(...progress.lines));
     sdk.resources.set(hostId, out.resource);
     host(hostId).lifecycle.phase = "suspended";
     return readSandboxResource(out.resource);
