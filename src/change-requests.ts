@@ -70,7 +70,10 @@ export const changeRequestSchema = z.object({
   identity: changeRequestIdentitySchema,
   title: z.string(),
   state: z.enum(CHANGE_REQUEST_STATES),
-  ci: z.object({ state: z.enum(CHANGE_REQUEST_CI_STATES).catch("unknown") }),
+  ci: z.object({
+    state: z.enum(CHANGE_REQUEST_CI_STATES).catch("unknown"),
+    reason: z.enum(CHANGE_REQUEST_UNAVAILABLE_REASONS).optional().catch(undefined),
+  }),
   sourceBranch: z.string().nullable(),
   targetBranch: z.string().nullable(),
   updatedAt: z.string().nullable(),
