@@ -18,17 +18,29 @@ and `bb plugin build` bundles it.
   messages, `findSecretLike` and `redactSecrets`. Frontend-safe: zod only.
 - `@wy3z/bb-suite/machine-backend/server`: `registerSandboxBackend(bb, backend,
   policy)` for vendor machine plugins. The vendor supplies only `create`,
-  `exec`, `snapshot`, `stop`, `resume`, `remove`, `listByName` and optional
-  `extendTtl`. `snapshot` must return only once the saved state is durable
-  (`snapshotId: null` means the compute keeps its state across `stop`, in
-  which case `stop` returns the surviving sandbox id). The helper registers
+  `exec`, `snapshot`, `findSnapshot`, `stop`, `resume`, `remove`, `listByName`
+  and optional `extendTtl`. `snapshot` must return only once the saved state
+  is durable (`snapshotId: null` means the compute keeps its state across
+  `stop`, in which case `stop` returns the surviving sandbox id). It receives
+  an `operationKey` that the helper records before the call. The vendor must
+  tag the snapshot with that key, return the same snapshot for a repeated
+  key, and answer `findSnapshot` with it. A `null` from `findSnapshot` means
+  the operation never produced a snapshot. `remove` resolving means the listed
+  compute and snapshots are gone. The helper registers
   the machine provider: an idempotent create keyed by name, with a checkpoint
   before allocating and core bootstrap over the vendor exec, plus a systemd
   probe. Suspend checkpoints the snapshot before stopping, stops every
-  allocation under the name, and verifies none is still running. Resume
+  allocation under the name, and verifies none is still running. Each snapshot
+  is bound to the compute it came from (`snapshotSandboxId`). If the current
+  compute has vanished and its only snapshot came from earlier compute,
+  suspend refuses rather than silently rolling back. Every snapshot id and
+  pending snapshot operation goes into a ledger that sweeps only add to; ids
+  leave it only once the vendor confirms deletion. Resume
   re-runs bootstrap, then `remove` and `reconcileCleanup` complete the
   provider. Create and resume are admitted one at a time, with slot
-  reservations against the concurrency and spend caps.
+  reservations against the concurrency and spend caps. A reservation holds its
+  slot until the vendor proves there is no compute under the name, including
+  after a lost response or a restart.
   It also registers the composed `project-checkout` environment and runs a
   minute sweep. The sweep suspends idle machines and extends the vendor TTL
   while a machine is active and under budget. Once the monthly cap is reached
@@ -37,8 +49,9 @@ and `bb plugin build` bundles it.
   running sandbox. It also removes orphaned allocations, but only after a
   complete ownership read and a grace period counted from when the allocation
   was first seen without an owner. Vendor progress, availability and validate
-  messages are redacted. Exec output is passed to core unchanged because core
-  parses installer output.
+  messages are redacted. Exec output is passed to core unchanged; core
+  line-buffers it into the progress report, which the helper has already
+  wrapped with redaction.
   It also installs a `message.dispatch` hook for its own sandboxes only that
   rejects a launch when the thread's agent has no cloud login. The check
   reads machine env names, never values, plus Account Pooler routing

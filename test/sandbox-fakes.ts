@@ -28,7 +28,8 @@ export function fakeBackend(clock: Clock, init = "none") {
   const sandboxes = new Map<string, FakeSandbox>();
   const snapshots = new Set<string>();
   const calls = { create: 0, snapshot: 0, stop: 0, resume: 0, remove: [] as Array<{ sandboxIds: string[]; snapshotIds: string[] }>, extend: 0, exec: [] as string[][] };
-  const faults: { create?: Error; exec?: Error; meta?: Record<string, string>; keepAfterRemove?: boolean; progress?: string; createDelay?: number } = {};
+  const faults: { create?: Error; exec?: Error; meta?: Record<string, string>; keepAfterRemove?: boolean; progress?: string; createDelay?: number; createLoseResponse?: boolean; snapshotLoseResponse?: boolean } = {};
+  const snapshotOps = new Map<string, string>();
   let seq = 0;
   const handle = (sandbox: FakeSandbox): SandboxHandle => ({
     id: sandbox.id,
@@ -49,6 +50,10 @@ export function fakeBackend(clock: Clock, init = "none") {
       seq += 1;
       const sandbox = { id: `sb-${seq}`, name, running: true, expiresAt: clock.now() + ttlMs, snapshotId: null };
       sandboxes.set(sandbox.id, sandbox);
+      if (faults.createLoseResponse) {
+        faults.createLoseResponse = false;
+        throw new Error("socket hang up after allocation");
+      }
       return handle(sandbox);
     },
     async exec(sandboxId, request) {
@@ -57,14 +62,25 @@ export function fakeBackend(clock: Clock, init = "none") {
       if (request.command.join(" ").includes("systemd")) request.onOutput(`${init}\n`);
       return { exitCode: 0 };
     },
-    async snapshot({ sandboxId, report }) {
+    async snapshot({ sandboxId, operationKey, report }) {
       calls.snapshot += 1;
       if (faults.progress) report.log(faults.progress);
+      const existing = snapshotOps.get(operationKey);
+      if (existing !== undefined) return { snapshotId: existing };
       if (!sandboxes.get(sandboxId)?.running) throw new Error("not running");
       seq += 1;
       const snapshotId = `snap-${seq}`;
       snapshots.add(snapshotId);
+      snapshotOps.set(operationKey, snapshotId);
+      if (faults.snapshotLoseResponse) {
+        faults.snapshotLoseResponse = false;
+        throw new Error("timeout waiting for snapshot response");
+      }
       return { snapshotId };
+    },
+    async findSnapshot({ operationKey }) {
+      const snapshotId = snapshotOps.get(operationKey);
+      return snapshotId !== undefined && snapshots.has(snapshotId) ? snapshotId : null;
     },
     async stop({ sandboxId }) {
       calls.stop += 1;

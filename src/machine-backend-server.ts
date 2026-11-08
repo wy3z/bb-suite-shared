@@ -70,9 +70,11 @@ export interface SandboxBackend<S extends SandboxInputsSchema = undefined> {
   snapshot(request: {
     sandboxId: string;
     name: string;
+    operationKey: string;
     signal: AbortSignal;
     report: SandboxProgress;
   }): Promise<{ snapshotId: string | null }>;
+  findSnapshot(request: { name: string; operationKey: string; signal: AbortSignal }): Promise<string | null>;
   stop(request: {
     sandboxId: string;
     name: string;
@@ -151,6 +153,7 @@ const allocationSchema = z.object({
   failures: z.number().int().nonnegative(),
   nextAttemptAt: z.number(),
   unownedSince: z.number().nullable().default(null),
+  pendingSnapshotOps: z.array(z.string()).default([]),
 });
 type Allocation = z.output<typeof allocationSchema>;
 
@@ -243,6 +246,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
       failures: 0,
       nextAttemptAt: 0,
       unownedSince: null,
+      pendingSnapshotOps: [],
     };
   }
 
@@ -322,9 +326,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
   }
 
   function holdsSlot(allocation: Allocation): boolean {
-    if (allocation.state === "running") return true;
-    if (allocation.state !== "allocating" && allocation.state !== "resuming") return false;
-    return inFlight.has(allocation.name) || allocation.sandboxId !== null;
+    return allocation.state === "running" || allocation.state === "allocating" || allocation.state === "resuming";
   }
 
   async function refusalFor(excludeName: string | null): Promise<string | null> {
@@ -487,6 +489,19 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
         const signal = AbortSignal.timeout(vendorTimeoutMs);
         const live = await backend.listByName(allocation.name, signal);
         const running = live.filter((handle) => handle.running);
+        if (allocation.state === "allocating" || allocation.state === "resuming" || allocation.state === "running") {
+          const found = running.find((handle) => handle.id === allocation.sandboxId) ?? running[0] ?? null;
+          allocation =
+            found !== null
+              ? {
+                  ...allocation,
+                  state: "running",
+                  sandboxId: found.id,
+                  accruedAt: allocation.accruedAt ?? at,
+                  expiresAt: found.expiresAt ?? allocation.expiresAt,
+                }
+              : { ...allocation, state: allocation.state === "resuming" ? "suspended" : "stopped", accruedAt: null };
+        }
         const owner = owned.get(allocation.key) ?? null;
         if (owner === null) {
           if (!complete) {
@@ -503,6 +518,8 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
             await writeAllocation({ ...allocation, unownedSince: fresh.owned.has(allocation.key) ? null : allocation.unownedSince });
             continue;
           }
+          await writeAllocation(allocation);
+          allocation = (await resolvePendingSnapshots(allocation.key, allocation.name, signal)) ?? allocation;
           if (live.length === 0 && allocation.snapshotIds.length === 0) {
             await kv.delete(`${ALLOCATION_PREFIX}${allocation.name}`);
             continue;
@@ -537,7 +554,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
           unownedSince: null,
           state: head !== null ? "running" : suspended ? "suspended" : "stopped",
           sandboxId: head?.id ?? allocation.sandboxId,
-          snapshotIds: unique([owner.resource.snapshotId, ...owner.resource.staleSnapshotIds]),
+          snapshotIds: unique([...allocation.snapshotIds, owner.resource.snapshotId, ...owner.resource.staleSnapshotIds]),
           accruedAt: head !== null ? (allocation.accruedAt ?? at) : null,
           expiresAt: head !== null ? (head.expiresAt ?? allocation.expiresAt) : allocation.expiresAt,
           failures: 0,
@@ -616,12 +633,36 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
     }
   }
 
-  async function releaseIfIdle(resource: Pick<SandboxResource, "key" | "name">, fallback: "suspended" | "stopped") {
+  async function settleAfterFailure(resource: Pick<SandboxResource, "key" | "name">, fallback: "suspended" | "stopped") {
     const live = await backend.listByName(resource.name, AbortSignal.timeout(vendorTimeoutMs)).catch(() => null);
-    if (live === null || live.some((handle) => handle.running)) return;
+    if (live === null) return;
     const stored = await readAllocation(resource.name);
-    if (stored === null || stored.state === "running" || stored.state === "suspended") return;
+    if (stored === null || stored.state === "suspended" || stored.state === "stopped") return;
+    const running = live.find((handle) => handle.running && handle.id === stored.sandboxId) ?? live.find((handle) => handle.running);
+    if (running !== undefined) {
+      await patchAllocation(resource.key, resource.name, (allocation, at) => ({
+        state: "running",
+        sandboxId: running.id,
+        accruedAt: allocation.accruedAt ?? at,
+        expiresAt: running.expiresAt ?? allocation.expiresAt,
+      }));
+      return;
+    }
     await patchAllocation(resource.key, resource.name, () => ({ state: fallback, accruedAt: null }));
+  }
+
+  async function resolvePendingSnapshots(key: string, name: string, signal: AbortSignal): Promise<Allocation | null> {
+    const stored = await readAllocation(name);
+    if (stored === null || stored.pendingSnapshotOps.length === 0) return stored;
+    const found: string[] = [];
+    for (const operationKey of stored.pendingSnapshotOps) {
+      const snapshotId = await backend.findSnapshot({ name, operationKey, signal });
+      if (snapshotId !== null) found.push(snapshotId);
+    }
+    return patchAllocation(key, name, (allocation) => ({
+      snapshotIds: unique([...allocation.snapshotIds, ...found]),
+      pendingSnapshotOps: allocation.pendingSnapshotOps.filter((op) => !stored.pendingSnapshotOps.includes(op)),
+    }));
   }
 
   bb.experimental_environments.register({
@@ -686,6 +727,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
             state: "allocating",
             sandboxId: null,
             snapshotId: null,
+            snapshotSandboxId: null,
             staleSnapshotIds: [],
             init: "unknown",
             meta: {},
@@ -728,7 +770,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
           await bumpIdle(hostId);
           return { status: "created", name: machineName(hostId), resource: asResource(resource) };
         } catch (error) {
-          await releaseIfIdle({ key: context.key, name }, "stopped");
+          await settleAfterFailure({ key: context.key, name }, "stopped");
           context.signal.throwIfAborted();
           return { status: "failed", message: errorText(error) };
         }
@@ -765,9 +807,14 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
           let next: SandboxResource = resource;
           if (running.length === 0) {
             const stoppedInPlace = resource.sandboxId !== null && live.some((handle) => handle.id === resource.sandboxId);
-            if (resource.snapshotId === null && !stoppedInPlace) {
+            const savedThisCompute =
+              resource.snapshotId !== null &&
+              (resource.state === "suspended" || resource.snapshotSandboxId === resource.sandboxId);
+            if (!savedThisCompute && !stoppedInPlace) {
               throw new Error(
-                `${label}: compute for ${resource.name} is gone and there is no saved snapshot or stopped sandbox to restore; refusing to report it suspended. Remove the machine to clean up.`,
+                resource.snapshotId === null
+                  ? `${label}: compute for ${resource.name} is gone and there is no saved snapshot or stopped sandbox to restore; refusing to report it suspended. Remove the machine to clean up.`
+                  : `${label}: compute ${resource.sandboxId} for ${resource.name} is gone and its last snapshot was taken from earlier compute, so changes since the last resume would be lost; refusing to report it suspended. Remove the machine to clean up.`,
               );
             }
             next = { ...resource, state: "suspended" };
@@ -785,21 +832,29 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
                 report,
               });
             }
+            await resolvePendingSnapshots(resource.key, resource.name, context.signal);
+            const operationKey = `${resource.name}-${globalThis.crypto.randomUUID().slice(0, 12)}`;
+            await patchAllocation(resource.key, resource.name, (allocation) => ({
+              pendingSnapshotOps: unique([...allocation.pendingSnapshotOps, operationKey]),
+            }));
             report.step(`Saving the ${label} sandbox…`);
             const saved = await backend.snapshot({
               sandboxId: primary.id,
               name: resource.name,
+              operationKey,
               signal: context.signal,
               report,
             });
             const tracked = await patchAllocation(resource.key, resource.name, (allocation) => ({
               snapshotIds: unique([...allocation.snapshotIds, saved.snapshotId]),
+              pendingSnapshotOps: allocation.pendingSnapshotOps.filter((op) => op !== operationKey),
             }));
             const snapshotId = saved.snapshotId ?? resource.snapshotId;
             next = {
               ...resource,
               sandboxId: primary.id,
               snapshotId,
+              snapshotSandboxId: saved.snapshotId !== null ? primary.id : resource.snapshotSandboxId,
               staleSnapshotIds: unique(
                 [...resource.staleSnapshotIds, resource.snapshotId, ...tracked.snapshotIds].filter((id) => id !== snapshotId),
               ),
@@ -827,11 +882,11 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
               `${label}: ${still.length} ${resource.name} allocation(s) are still running after suspend; retry.`,
             );
           }
-          await patchAllocation(resource.key, resource.name, () => ({
+          await patchAllocation(resource.key, resource.name, (allocation) => ({
             state: "suspended",
             hostId: context.hostId,
             sandboxId: next.sandboxId,
-            snapshotIds: unique([next.snapshotId, ...next.staleSnapshotIds]),
+            snapshotIds: unique([...allocation.snapshotIds, next.snapshotId, ...next.staleSnapshotIds]),
             accruedAt: null,
           }));
           await kv.delete(`${IDLE_PREFIX}${context.hostId}`);
@@ -887,23 +942,26 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
           await bumpIdle(context.hostId);
           if (next.staleSnapshotIds.length > 0) {
             try {
+              const deleted = next.staleSnapshotIds;
               await backend.remove({
                 name: resource.name,
                 sandboxIds: [],
-                snapshotIds: next.staleSnapshotIds,
+                snapshotIds: deleted,
                 signal: context.signal,
                 report,
               });
               next = { ...next, staleSnapshotIds: [] };
               await context.checkpoint(asResource(next));
-              await patchAllocation(resource.key, resource.name, () => ({ snapshotIds: unique([next.snapshotId]) }));
+              await patchAllocation(resource.key, resource.name, (allocation) => ({
+                snapshotIds: allocation.snapshotIds.filter((id) => !deleted.includes(id)),
+              }));
             } catch (error) {
               report.log(`Stale snapshot cleanup will retry later: ${errorText(error)}`);
             }
           }
           return { resource: asResource(next) };
         } catch (error) {
-          await releaseIfIdle(resource, "suspended");
+          await settleAfterFailure(resource, "suspended");
           context.signal.throwIfAborted();
           throw new Error(errorText(error));
         }
@@ -921,7 +979,7 @@ export function registerSandboxBackend<S extends SandboxInputsSchema = undefined
         try {
           const live = await backend.listByName(resource.name, context.signal);
           const sandboxIds = unique([resource.sandboxId, ...live.map((handle) => handle.id)]);
-          const stored = await readAllocation(resource.name);
+          const stored = await resolvePendingSnapshots(resource.key, resource.name, context.signal);
           const snapshotIds = unique([resource.snapshotId, ...resource.staleSnapshotIds, ...(stored?.snapshotIds ?? [])]);
           if (sandboxIds.length > 0 || snapshotIds.length > 0) {
             report.step(`Removing the ${label} sandbox…`);

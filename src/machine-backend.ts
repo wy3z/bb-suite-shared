@@ -36,6 +36,7 @@ export const sandboxResourceSchema = z.object({
   state: z.enum(SANDBOX_STATES),
   sandboxId: z.string().min(1).nullable(),
   snapshotId: z.string().min(1).nullable(),
+  snapshotSandboxId: z.string().min(1).nullable().default(null),
   staleSnapshotIds: z.array(z.string().min(1)),
   init: z.enum(SANDBOX_INIT_KINDS),
   meta: z.record(z.string(), z.json()),

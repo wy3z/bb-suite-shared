@@ -98,4 +98,3 @@ export function setup(policy: SandboxPolicySource = { hourlyRateUsd: 0.5 }, init
 
   return { clock, sdk, fake, registration, create, suspend, resume, remove, host, allocation };
 }
-
